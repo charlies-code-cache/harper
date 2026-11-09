@@ -165,8 +165,30 @@ impl RenderState {
                         && old.source_text == new.source_text
                 })
         });
-        if !same_lint {
-            self.close_popup();
+        // Harper Plus: AI rewrites narrow long underlines to the words they change. Follow the open
+        // card to its narrowed lint instead of closing it.
+        let followed = if same_lint {
+            None
+        } else {
+            self.highlighted_lint
+                .and_then(|index| self.lints().get(index))
+                .and_then(|old| {
+                    lints.iter().position(|new| {
+                        new.rule_name == old.rule_name
+                            && new.source_text == old.source_text
+                            && new.lint.message == old.lint.message
+                            && new.lint.span.start < old.lint.span.end
+                            && old.lint.span.start < new.lint.span.end
+                    })
+                })
+        };
+        match followed {
+            Some(index) => {
+                self.highlighted_lint = Some(index);
+                self.card_height = None;
+            }
+            None if !same_lint => self.close_popup(),
+            None => {}
         }
         self.last_lints = Some(lints);
 
