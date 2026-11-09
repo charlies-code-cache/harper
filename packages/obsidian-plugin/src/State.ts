@@ -1,10 +1,16 @@
 import type { Extension, StateField } from '@codemirror/state';
+import type { EditorView } from '@codemirror/view';
 import type { Lint, LintConfig, Linter, StructuredLintConfig, Suggestion } from 'harper.js';
 import { type Dialect, LocalLinter, SuggestionKind, WorkerLinter } from 'harper.js';
 import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { minimatch } from 'minimatch';
 import type { MarkdownFileInfo } from 'obsidian';
-import { type Action, linter } from './lint';
+import AiEngine, { type Finding, type HttpTransport } from './ai/AiEngine';
+import { applyToView, type RewriteTarget, renderRewriteSection } from './ai/aiUi';
+import { findingLabel, type FindingType, type RewriteGoal } from './ai/prompts';
+import { type AiSettings, withAiDefaults } from './ai/settings';
+import { lineAround, sentenceAround } from './ai/text';
+import { type Action, aiRefreshEffect, type Diagnostic, linter } from './lint';
 import { lintKindClass } from './lintKindColor';
 
 export type Settings = {
@@ -18,7 +24,35 @@ export type Settings = {
 	lintEnabled?: boolean;
 	regexMask?: string;
 	useWebStyleLints?: boolean;
+	/** Harper Plus AI settings. */
+	ai?: AiSettings;
 };
+
+/** Lint kinds whose problems are about a whole sentence, which get AI rewrites in the "sentence" scope. */
+const SENTENCE_LEVEL_KINDS = new Set([
+	'Readability',
+	'Style',
+	'Redundancy',
+	'Repetition',
+	'WordChoice',
+	'Enhancement',
+	'WordOrder',
+	'Usage',
+	'Nonstandard',
+]);
+
+const SPELLING_KINDS = new Set(['Spelling', 'Typo', 'Eggcorn', 'Malapropism']);
+
+/** Maps AI finding types onto Harper lint kinds so they share Harper's colors. */
+const FINDING_KIND: Record<FindingType, string> = {
+	clarity: 'Readability',
+	conciseness: 'Redundancy',
+	word_choice: 'WordChoice',
+	fluency: 'Style',
+};
+
+/** The rule name AI lints are reported under. */
+export const AI_SOURCE = 'HarperPlusAI';
 
 const DEFAULT_DELAY = -1;
 
@@ -34,6 +68,8 @@ export default class State {
 	private lintEnabled?: boolean;
 	private regexMask?: string;
 	private useWebStyleLints = false;
+	private aiSettings: AiSettings = withAiDefaults(null);
+	private ai: AiEngine | null = null;
 
 	/** The CodeMirror extension objects that should be inserted by the host. */
 	private editorExtensions: Extension[];
@@ -45,6 +81,7 @@ export default class State {
 		saveDataCallback: (data: any) => Promise<void>,
 		onExtensionChange: () => void,
 		_editorInfoField?: StateField<MarkdownFileInfo>,
+		http?: HttpTransport,
 	) {
 		this.harper = new WorkerLinter({ binary: slimBinaryInlined });
 		this.delay = DEFAULT_DELAY;
@@ -53,6 +90,25 @@ export default class State {
 		this.editorExtensions = [];
 
 		this.editorInfoField = _editorInfoField;
+		if (http) {
+			this.ai = new AiEngine(http, () => this.aiSettings);
+		}
+	}
+
+	/** The AI engine, if AI features are available in this host. */
+	public getAiEngine(): AiEngine | null {
+		return this.ai;
+	}
+
+	public getAiSettings(): AiSettings {
+		return this.aiSettings;
+	}
+
+	/** Updates AI settings, persists them, and re-lints. */
+	public async setAiSettings(patch: Partial<AiSettings>) {
+		const settings = await this.getSettings();
+		settings.ai = withAiDefaults({ ...this.aiSettings, ...patch });
+		await this.initializeFromSettings(settings);
 	}
 
 	public async initializeFromSettings(settings: Settings | null) {
@@ -107,6 +163,18 @@ export default class State {
 		this.lintEnabled = settings.lintEnabled;
 		this.regexMask = settings.regexMask;
 		this.useWebStyleLints = settings.useWebStyleLints ?? false;
+		const nextAi = withAiDefaults(settings.ai);
+		if (
+			nextAi.model !== this.aiSettings.model ||
+			nextAi.ollamaUrl !== this.aiSettings.ollamaUrl ||
+			nextAi.rewriteCount !== this.aiSettings.rewriteCount ||
+			nextAi.styleNote !== this.aiSettings.styleNote ||
+			nextAi.temperature !== this.aiSettings.temperature
+		) {
+			this.ai?.clearCache();
+		}
+		this.aiSettings = nextAi;
+		settings.ai = nextAi;
 
 		// Reinitialize it.
 		if (this.hasEditorLinter()) {
@@ -140,7 +208,7 @@ export default class State {
 				const text = view.state.doc.sliceString(-1);
 				const lints = await this.harper.organizedLints(text, { regex_mask: this.regexMask });
 
-				return Object.entries(lints).flatMap(([linterName, lints]) =>
+				const harperDiagnostics = Object.entries(lints).flatMap(([linterName, lints]) =>
 					lints.map((lint) => {
 						const span = lint.span();
 
@@ -228,6 +296,13 @@ export default class State {
 							ignore: async () => {
 								await this.ignoreLints(text, [lint]);
 							},
+							renderExtra: this.rewriteRendererForLint(
+								lint.lint_kind(),
+								lint.message(),
+								span.start,
+								span.end,
+								text,
+							),
 							disable: async () => {
 								const lintConfig = await this.harper.getLintConfig();
 								lintConfig[linterName] = false;
@@ -237,14 +312,115 @@ export default class State {
 							},
 
 							actions,
-						};
+						} as Diagnostic;
 					}),
 				);
+
+				return harperDiagnostics.concat(this.aiDiagnostics(view, text));
 			},
 			{
 				delay: this.delay,
 			},
 		);
+	}
+
+	private aiReady(): boolean {
+		return this.ai != null && this.aiSettings.enabled;
+	}
+
+	/** Decides whether a Harper lint gets AI rewrites and, in prefetch mode, starts generating them. */
+	private rewriteRendererForLint(
+		kind: string,
+		message: string,
+		from: number,
+		to: number,
+		text: string,
+	): Diagnostic['renderExtra'] {
+		const ai = this.ai;
+		const s = this.aiSettings;
+		if (ai == null || !s.enabled || !s.rewrites || SPELLING_KINDS.has(kind)) return undefined;
+		if (s.rewriteScope === 'sentence' && !SENTENCE_LEVEL_KINDS.has(kind)) return undefined;
+
+		const sentence = sentenceAround(text, from, to);
+		const target = text.slice(sentence.from, sentence.to);
+		const line = lineAround(text, from);
+		const context = text.slice(line.from, line.to);
+		const goal: RewriteGoal = { kind: 'fix', problem: message };
+
+		if (s.timing === 'prefetch') {
+			ai.requestRewrites(target, context, goal, 'prefetch');
+		}
+
+		return (view, current) =>
+			renderRewriteSection({
+				engine: ai,
+				settings: this.aiSettings,
+				goal,
+				showTones: this.aiSettings.toneRewrites,
+				resolve: () => resolveTarget(view, current, target, context),
+				apply: (t, rewrite) => applyToView(view, t, rewrite),
+				onResize: () => view.requestMeasure(),
+			});
+	}
+
+	/** Turns cached AI scan findings into diagnostics and queues scans for settled paragraphs. */
+	private aiDiagnostics(view: EditorView, text: string): Diagnostic[] {
+		const ai = this.ai;
+		if (ai == null || !this.aiReady()) return [];
+		const refresh = () => {
+			// Re-linting closes open popups, so wait until the user is done with one.
+			if (view.dom.querySelector('.cm-tooltip-lint') != null) {
+				setTimeout(refresh, 1500);
+				return;
+			}
+			try {
+				view.dispatch({ effects: aiRefreshEffect.of(null) });
+			} catch {
+				// The view was destroyed.
+			}
+		};
+		const findings = ai.scan(text, refresh);
+		return findings.map((f) => this.findingToDiagnostic(f, ai));
+	}
+
+	private findingToDiagnostic(f: Finding, ai: AiEngine): Diagnostic {
+		const goal: RewriteGoal = { kind: 'finding', findingType: f.type, reason: f.reason };
+		if (this.aiSettings.timing === 'prefetch') {
+			ai.requestRewrites(f.quote, f.paragraph, goal, 'prefetch');
+		}
+		const feature: 'clarity' | 'wordChoice' =
+			f.type === 'clarity' || f.type === 'conciseness' ? 'clarity' : 'wordChoice';
+		return {
+			from: f.from,
+			to: f.to,
+			source: AI_SOURCE,
+			severity: 'info',
+			markClass: `${lintKindClass(FINDING_KIND[f.type])} harper-plus-ai-range ${this.useWebStyleLints ? 'harper-web-style' : 'harper-squiggly-style'}`,
+			title: `${findingLabel(f.type)} (AI)`,
+			message: f.reason.length > 0 ? f.reason : `Possible ${findingLabel(f.type).toLowerCase()} issue.`,
+			actions: [],
+			ignore: async () => {
+				await this.setAiSettings({ ignored: [...this.aiSettings.ignored, f.id] });
+			},
+			disable: async () => {
+				await this.setAiSettings({ [feature]: false });
+			},
+			renderExtra: (view, current) =>
+				renderRewriteSection({
+					engine: ai,
+					settings: this.aiSettings,
+					goal,
+					showTones: this.aiSettings.toneRewrites,
+					resolve: () => {
+						const range = current();
+						if (range == null) return null;
+						const now = view.state.doc.sliceString(range.from, range.to);
+						return now === f.quote ? { ...range, text: f.quote, context: f.paragraph } : null;
+					},
+					apply: (t, rewrite) => applyToView(view, t, rewrite),
+					onResize: () => view.requestMeasure(),
+				}),
+		};
 	}
 
 	/** Use this method instead of interacting with the linter directly. */
@@ -278,6 +454,7 @@ export default class State {
 			lintEnabled: this.lintEnabled,
 			regexMask: this.regexMask,
 			useWebStyleLints: this.useWebStyleLints,
+			ai: this.aiSettings,
 		};
 	}
 
@@ -404,4 +581,24 @@ function suggestionToLabel(sug: Suggestion): string {
 		case SuggestionKind.InsertAfter:
 			return `Insert “${sug.get_replacement_text()}” after this.`;
 	}
+}
+
+/** Re-finds a sentence target in the current document, following edits made since it was linted. */
+function resolveTarget(
+	view: EditorView,
+	current: () => { from: number; to: number } | null,
+	target: string,
+	context: string,
+): RewriteTarget | null {
+	const range = current();
+	if (range == null) return null;
+	const doc = view.state.doc.toString();
+	const sentence = sentenceAround(doc, range.from, range.to);
+	if (doc.slice(sentence.from, sentence.to) === target) {
+		return { ...sentence, text: target, context };
+	}
+	const line = lineAround(doc, range.from);
+	const idx = doc.slice(line.from, line.to).indexOf(target);
+	if (idx < 0) return null;
+	return { from: line.from + idx, to: line.from + idx + target.length, text: target, context };
 }

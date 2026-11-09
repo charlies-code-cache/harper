@@ -1,0 +1,10 @@
+{
+  "id": "harper-plus",
+  "name": "Harper Plus",
+  "version": "3.1.0-plus.1",
+  "minAppVersion": "1.7.7",
+  "description": "Harper grammar checking plus local AI rewrites, clarity, tone, and word choice suggestions powered by Ollama.",
+  "author": "Charlie (fork of Harper by Elijah Potter)",
+  "authorUrl": "https://github.com/charlies-code-cache/harper",
+  "isDesktopOnly": true
+}

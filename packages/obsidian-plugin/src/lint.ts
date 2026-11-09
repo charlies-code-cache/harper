@@ -57,6 +57,12 @@ export interface Diagnostic {
 	ignore?: () => void;
 	/// A callback for when the user selects to "disable" the source of the diagnostic.
 	disable?: () => void;
+	/// Harper Plus: optional extra content (AI rewrites) rendered under the actions.
+	/// `current` returns the diagnostic's current mapped range, or null if it is gone.
+	renderExtra?: (
+		view: EditorView,
+		current: () => { from: number; to: number } | null,
+	) => Node | null;
 }
 
 /// An action associated with a diagnostic.
@@ -199,6 +205,9 @@ export function setDiagnostics(
 /// be useful when writing an extension that needs to track these.
 export const setDiagnosticsEffect = StateEffect.define<readonly Diagnostic[]>();
 
+/// Harper Plus: dispatch this effect to re-run the linter (e.g. when AI findings arrive).
+export const aiRefreshEffect = StateEffect.define<null>();
+
 const movePanelSelection = StateEffect.define<SelectedDiagnostic | null>();
 const setCommandTooltipEffect = StateEffect.define<SelectedDiagnostic | null>();
 
@@ -340,6 +349,7 @@ const lintPlugin = ViewPlugin.fromClass(
 			const config = update.state.facet(lintConfig);
 			if (
 				update.docChanged ||
+				update.transactions.some((tr) => tr.effects.some((e) => e.is(aiRefreshEffect))) ||
 				config != update.startState.facet(lintConfig) ||
 				config.needsRefresh?.(update)
 			) {
@@ -468,6 +478,12 @@ function renderDiagnostic(view: EditorView, diagnostic: Diagnostic, inPanel: boo
 				);
 			}),
 		),
+		inPanel || !diagnostic.renderExtra
+			? null
+			: diagnostic.renderExtra(view, () => {
+					const found = findDiagnostic(view.state.field(lintState).diagnostics, diagnostic);
+					return found ? { from: found.from, to: found.to } : null;
+				}),
 		elt('div', { class: 'cm-diagnosticRow' }, [
 			diagnostic.ignore &&
 				elt(
@@ -712,6 +728,81 @@ const baseTheme = EditorView.baseTheme({
 	'.cm-tooltip-lint': {
 		padding: 0,
 		margin: 0,
+	},
+
+	'.harper-plus-ai': {
+		marginTop: '6px',
+		paddingTop: '6px',
+		borderTop: '1px solid var(--background-modifier-border, #8884)',
+		display: 'flex',
+		flexDirection: 'column',
+		gap: '4px',
+		maxWidth: '460px',
+		whiteSpace: 'normal',
+	},
+	'.harper-plus-ai-header': {
+		display: 'flex',
+		alignItems: 'center',
+		justifyContent: 'space-between',
+		gap: '8px',
+	},
+	'.harper-plus-ai-title': {
+		fontWeight: 'bold',
+		fontSize: '0.9em',
+		boxShadow: 'inset 0 -2px #8a5cf5',
+	},
+	'.harper-plus-ai-badge': {
+		fontSize: '0.75em',
+		opacity: '0.6',
+	},
+	'.harper-plus-ai-list': {
+		display: 'flex',
+		flexDirection: 'column',
+		gap: '4px',
+	},
+	'.harper-plus-ai-rewrite': {
+		textAlign: 'left',
+		whiteSpace: 'normal',
+		height: 'auto',
+		lineHeight: '1.4',
+		padding: '6px 8px',
+		cursor: 'pointer',
+		borderRadius: '6px',
+		border: '1px solid var(--background-modifier-border, #8884)',
+		background: 'var(--background-secondary, #f6f8fa)',
+		color: 'var(--text-normal, inherit)',
+		fontSize: '0.92em',
+	},
+	'.harper-plus-ai-rewrite:hover': {
+		borderColor: '#8a5cf5',
+		background: 'var(--background-modifier-hover, #8a5cf522)',
+	},
+	'.harper-plus-ai-loading, .harper-plus-ai-error': {
+		fontSize: '0.85em',
+		opacity: '0.75',
+		fontStyle: 'italic',
+	},
+	'.harper-plus-ai-tones': {
+		display: 'flex',
+		flexWrap: 'wrap',
+		alignItems: 'center',
+		gap: '4px',
+		marginTop: '2px',
+	},
+	'.harper-plus-ai-tones-label': {
+		fontSize: '0.8em',
+		opacity: '0.7',
+	},
+	'.harper-plus-ai-chip': {
+		fontSize: '0.78em',
+		padding: '1px 8px',
+		height: 'auto',
+		borderRadius: '999px',
+		cursor: 'pointer',
+	},
+	'.harper-plus-ai-chip.is-active': {
+		background: '#8a5cf5',
+		color: 'white',
 	},
 
 	'.cm-lintPoint': {

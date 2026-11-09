@@ -7,6 +7,7 @@ import { type App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type HarperPlugin from './index.js';
 import type State from './State.js';
 import type { Settings } from './State.js';
+import { renderAiSettings } from './ai/AiSettingsSection';
 import { linesToString, stringToLines } from './textUtils';
 
 const LintSettingId = 'HarperLintSettings';
@@ -84,6 +85,11 @@ export class HarperSettingTab extends PluginSettingTab {
 		}
 
 		const settings = this.settings;
+
+		if (this.state != null) {
+			renderAiSettings(containerEl, this.state, settings);
+			new Setting(containerEl).setName('Harper').setHeading();
+		}
 
 		new Setting(containerEl)
 			.setName('Use Web Worker')

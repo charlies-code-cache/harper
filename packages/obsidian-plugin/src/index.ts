@@ -3,6 +3,7 @@ import { Dialect } from 'harper.js';
 import { addIcon, editorInfoField, MarkdownView, Menu, Notice, Plugin } from 'obsidian';
 import logoSvg from '../logo.svg?raw';
 import logoSvgDisabled from '../logo-disabled.svg?raw';
+import { ObsidianAi, obsidianTransport } from './ai/obsidianAi';
 import { HarperSettingTab } from './HarperSettingTab';
 import {
 	addWordToDictionaryFromVisibleTooltip,
@@ -38,6 +39,7 @@ export default class HarperPlugin extends Plugin {
 				(n) => this.saveData(n),
 				() => this.app.workspace.updateOptions(),
 				editorInfoField,
+				obsidianTransport,
 			);
 
 			this.registerEditorExtension(this.state.getCMEditorExtensions());
@@ -51,6 +53,7 @@ export default class HarperPlugin extends Plugin {
 		this.registerView('harper-sidebar-view', (leaf) => new SidebarView(leaf, this));
 
 		this.setupCommands();
+		new ObsidianAi(this, () => this.state).setup();
 	}
 
 	async activateSidebarView() {
