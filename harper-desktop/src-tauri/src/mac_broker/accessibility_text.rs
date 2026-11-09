@@ -10,7 +10,10 @@ use accessibility_sys::{
 use core::{ffi::c_void, mem::MaybeUninit};
 use core_foundation::base::{CFRange, CFType, TCFType};
 use core_foundation::string::CFString;
-use harper_core::linting::{Lint, Suggestion};
+use harper_core::{
+    Span,
+    linting::Suggestion,
+};
 use objc2_foundation::NSRect;
 use std::{
     cell::{Cell, RefCell},
@@ -171,18 +174,17 @@ impl TreeVisitor for RectCollector<'_> {
                     let element = element.clone();
                     let source_text = string.clone();
                     let suggestion_source_text = string.clone();
-                    let suggestion_lint = lint.clone();
 
                     rects.push(ActionableLint::new(
                         rect,
                         rule_name.clone(),
                         lint,
                         source_text,
-                        move |suggestion| {
+                        move |span, suggestion| {
                             apply_suggestion_to_element(
                                 element,
                                 suggestion_source_text,
-                                suggestion_lint,
+                                span,
                                 suggestion,
                             );
                         },
@@ -220,11 +222,11 @@ impl<'a> RectCollector<'a> {
 fn apply_suggestion_to_element(
     element: AXUIElement,
     source_text: String,
-    lint: Lint,
+    span: Span<char>,
     suggestion: Suggestion,
 ) {
     let mut chars = source_text.chars().collect::<Vec<_>>();
-    suggestion.apply(lint.span, &mut chars);
+    suggestion.apply(span, &mut chars);
     let updated = chars.into_iter().collect::<String>();
     let value = CFString::new(&updated);
 

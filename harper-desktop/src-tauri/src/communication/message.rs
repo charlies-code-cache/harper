@@ -1,4 +1,4 @@
-use crate::config::Integration;
+use crate::{ai::AiConfig, config::Integration};
 use harper_core::{Dialect, IgnoredLints, linting::FlatConfig};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,8 @@ pub enum Request {
     GetIgnoredLints,
     GetIntegrations,
     GetAutoEnableNewApps,
+    GetAiConfig,
+    SetAiConfig { config: AiConfig },
     ResolveIntegration { bundle_id: String },
     SetLintConfig { config: FlatConfig },
     IgnoreLint { ignored_lints: IgnoredLints },
@@ -32,6 +34,7 @@ pub enum Response {
     GetIgnoredLints { ignored_lints: IgnoredLints },
     GetIntegrations { integrations: Vec<Integration> },
     GetAutoEnableNewApps { enabled: bool },
+    GetAiConfig { config: AiConfig },
     ResolveIntegration { enabled: bool },
     Ack,
 }

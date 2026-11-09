@@ -1,4 +1,8 @@
 //! Renders the lint card and defines its shared drawing and hit-test geometry.
+//!
+//! Harper Plus draws the compact card at the bottom of this file; the upstream two-card renderer is
+//! kept for its tests and as a reference.
+#![allow(dead_code)]
 
 use std::{hash::Hash, sync::Arc};
 
@@ -8,10 +12,11 @@ use harper_core::linting::{Lint, LintKind, Suggestion};
 use super::super::fonts;
 use super::lint_kind_color32;
 use super::popup_layout::{PopupLayout, UNBOUNDED_VIEWPORT, popup_layout};
+use crate::ai::{AiStatus, Tone, diff::{DiffPart, change_ratio, rewrite_clusters, word_diff}};
 use crate::rect::Rect;
 
 const LIST_WIDTH: f32 = 210.0;
-const FLYOUT_WIDTH: f32 = 190.0;
+const FLYOUT_WIDTH: f32 = 300.0;
 const DIVIDER_WIDTH: f32 = 1.0;
 const BORDER_WIDTH: f32 = 1.0;
 const LIST_CARD_WIDTH: f32 = LIST_WIDTH + 2.0 * BORDER_WIDTH;
@@ -122,7 +127,42 @@ pub enum LintCardAction {
     IgnoreLint,
     AddToDictionary,
     DisableRule,
+    /// Harper Plus: replace the AI target with this rewrite.
+    ApplyRewrite(String),
+    /// Harper Plus: switch the AI rewrites to a tone, or back to the default goal.
+    SelectTone(Option<Tone>),
+    /// Harper Plus: show or hide the "See more" part of the card.
+    ToggleMore,
+    /// Harper Plus: replace source chars `start..end` with `text` (one small correction).
+    ApplyEdit {
+        start: usize,
+        end: usize,
+        text: String,
+    },
 }
+
+/// Harper Plus: what the AI section of the flyout shows for the open lint.
+pub struct AiCard {
+    /// Grammarly-style header, e.g. "Improve your text".
+    pub heading: String,
+    /// The text being rewritten, used to draw the diff.
+    pub target: String,
+    pub status: AiStatus<Vec<String>>,
+    pub tones_enabled: bool,
+    pub active_tone: Option<Tone>,
+    /// Short tone of the whole text, when tone detection is on and ready.
+    pub tone_summary: Option<String>,
+    /// Char offset of `target` in the source text, for applying single edits.
+    pub target_start: usize,
+    /// The flagged span (source offsets); the card shows only the edits that touch it.
+    pub focus: (usize, usize),
+    /// False when Harper already has a fix: the AI rewrite waits behind "See more".
+    pub primary: bool,
+}
+
+const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x38, 0x38);
+const INS_COLOR: egui::Color32 = egui::Color32::from_rgb(0x4a, 0x6e, 0xe0);
+const ACCENT_FILL: egui::Color32 = egui::Color32::from_rgb(0xdd, 0xe4, 0xfb);
 
 #[derive(Debug, Clone, Copy)]
 enum Glyph {
@@ -153,6 +193,7 @@ pub fn render_lint_card(
     shown_suggestion: Option<usize>,
     tip: Option<&TipLayout>,
     markdown_cache: &mut CommonMarkCache,
+    ai: Option<&AiCard>,
 ) -> Option<LintCardAction> {
     let problem_text = problem_text(lint, source_text);
     let span = (lint.span.start, lint.span.end);
@@ -165,6 +206,7 @@ pub fn render_lint_card(
             &problem_text,
             shown_suggestion.unwrap_or(0),
             tip,
+            ai.is_some(),
             &mut action,
         );
         action
@@ -177,7 +219,7 @@ pub fn render_lint_card(
         layout.flyout,
         |ui| {
             let mut action = None;
-            render_flyout(ui, lint, markdown_cache, &mut action);
+            render_flyout(ui, lint, markdown_cache, ai, &mut action);
             action
         },
     );
@@ -249,18 +291,24 @@ fn render_suggestion_list(
     problem_text: &str,
     selected: usize,
     tip: Option<&TipLayout>,
+    has_ai: bool,
     action: &mut Option<LintCardAction>,
 ) {
     ui.add_space(LIST_PADDING_Y);
 
-    if lint.suggestions.is_empty()
-        && suggestion_row(
-            ui,
-            lint.lint_kind,
-            "No replacements",
-            format!("No replacements for \"{problem_text}\""),
-            selected == 0,
+    let (empty_label, empty_hover) = if has_ai {
+        (
+            "See AI rewrites".to_owned(),
+            "AI rewrites are in the card on the side".to_owned(),
         )
+    } else {
+        (
+            "No replacements".to_owned(),
+            format!("No replacements for \"{problem_text}\""),
+        )
+    };
+    if lint.suggestions.is_empty()
+        && suggestion_row(ui, lint.lint_kind, &empty_label, empty_hover, selected == 0)
         .hovered()
     {
         *action = Some(LintCardAction::HoverSuggestion(0));
@@ -483,6 +531,7 @@ fn render_flyout(
     ui: &mut egui::Ui,
     lint: &Lint,
     markdown_cache: &mut CommonMarkCache,
+    ai: Option<&AiCard>,
     action: &mut Option<LintCardAction>,
 ) {
     render_kind_header(ui, lint.lint_kind);
@@ -493,6 +542,10 @@ fn render_flyout(
             ui.set_width(FLYOUT_WIDTH - 20.0);
             render_lint_message(ui, markdown_cache, &lint.message, lint.lint_kind);
         });
+
+    if let Some(ai) = ai {
+        render_ai_section(ui, ai, action);
+    }
 
     egui::Frame::new()
         .inner_margin(egui::Margin {
@@ -534,6 +587,129 @@ fn render_flyout(
     if disable_rule_row(ui).clicked() {
         *action = Some(LintCardAction::DisableRule);
     }
+}
+
+/// Harper Plus: draws the AI rewrites the way Grammarly does, as whole sentences with removed words
+/// struck through in red and added words in bold blue, then tone chips and the text's tone.
+fn render_ai_section(ui: &mut egui::Ui, ai: &AiCard, action: &mut Option<LintCardAction>) {
+    let width = FLYOUT_WIDTH - 20.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(FLYOUT_WIDTH, DIVIDER_WIDTH), egui::Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        egui::Stroke::new(DIVIDER_WIDTH, DIVIDER_COLOR),
+    );
+
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 })
+        .show(ui, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+            ui.label(egui::RichText::new(&ai.heading).size(12.0).color(MUTED_TEXT_COLOR));
+
+            match &ai.status {
+                AiStatus::Pending => {
+                    ui.label(
+                        egui::RichText::new("Generating rewrites...")
+                            .size(12.0)
+                            .italics()
+                            .color(SUBTLE_TEXT_COLOR),
+                    );
+                }
+                AiStatus::Error(message) => {
+                    ui.label(egui::RichText::new(message).size(12.0).color(SUBTLE_TEXT_COLOR));
+                }
+                AiStatus::Ready(rewrites) => {
+                    for rewrite in rewrites {
+                        if rewrite_row(ui, &ai.target, rewrite, width).clicked() {
+                            *action = Some(LintCardAction::ApplyRewrite(rewrite.clone()));
+                        }
+                    }
+                }
+            }
+
+            if ai.tones_enabled {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                    for tone in Tone::ALL {
+                        let active = ai.active_tone == Some(tone);
+                        let fill = if active { ACCENT_FILL } else { BUTTON_BACKGROUND };
+                        if flyout_button(
+                            ui,
+                            ButtonContent::Text(tone.label()),
+                            fill,
+                            format!("Rewrite to sound more {}", tone.name()),
+                        )
+                        .clicked()
+                        {
+                            *action = Some(LintCardAction::SelectTone((!active).then_some(tone)));
+                        }
+                    }
+                });
+            }
+
+            if let Some(summary) = &ai.tone_summary {
+                ui.label(
+                    egui::RichText::new(format!("Tone of this text: {summary}"))
+                        .size(11.0)
+                        .color(SUBTLE_TEXT_COLOR),
+                );
+            }
+        });
+}
+
+/// One clickable rewrite, drawn as an inline diff against `original`.
+fn rewrite_row(ui: &mut egui::Ui, original: &str, rewrite: &str, width: f32) -> egui::Response {
+    const SIZE: f32 = 13.0;
+    const PAD: f32 = 6.0;
+    let parts = word_diff(original, rewrite);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width - 2.0 * PAD;
+    let normal = egui::TextFormat::simple(egui::FontId::proportional(SIZE), TEXT_COLOR);
+    if change_ratio(&parts, original) > 0.6 {
+        job.append(rewrite, 0.0, normal);
+    } else {
+        for part in parts {
+            match part {
+                DiffPart::Same(t) => job.append(&t, 0.0, normal.clone()),
+                DiffPart::Del(t) => job.append(
+                    &t,
+                    0.0,
+                    egui::TextFormat {
+                        color: DEL_COLOR,
+                        strikethrough: egui::Stroke::new(1.0_f32, DEL_COLOR),
+                        background: egui::Color32::from_rgba_unmultiplied(0xd9, 0x38, 0x38, 22),
+                        ..normal.clone()
+                    },
+                ),
+                DiffPart::Ins(t) => job.append(
+                    &t,
+                    4.0,
+                    egui::TextFormat {
+                        font_id: fonts::bold(SIZE),
+                        color: INS_COLOR,
+                        background: egui::Color32::from_rgba_unmultiplied(0x4a, 0x6e, 0xe0, 22),
+                        ..normal.clone()
+                    },
+                ),
+            }
+        }
+    }
+    let galley = ui.painter().layout_job(job);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, galley.size().y + 2.0 * PAD),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 6.0, HOVER_BACKGROUND);
+    }
+    ui.painter()
+        .galley(rect.min + egui::vec2(PAD, PAD), galley, TEXT_COLOR);
+    hover_text(
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
+        "Click to use this rewrite",
+    )
 }
 
 /// Renders the lint kind above the explanation, underlined in the lint color.
@@ -1013,4 +1189,390 @@ mod tests {
             egui::Color32::from_rgb(50, 100, 0)
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Harper Plus: compact, Grammarly-style suggestion card.
+// ---------------------------------------------------------------------------------------------
+
+/// Width of the single suggestion card, in points.
+pub const GCARD_WIDTH: f32 = 380.0;
+/// Hit-test height used before a card has been measured once.
+pub const GCARD_MAX_HEIGHT: f32 = 460.0;
+const GCARD_PAD_X: f32 = 18.0;
+const GCARD_PAD_Y: f32 = 14.0;
+const GCARD_BIG: f32 = 17.0;
+
+/// Places the single card below (or above) the lint, like the list card used to be placed.
+pub fn gcard_layout(rect: &Rect, height: f32) -> PopupLayout {
+    let layout = popup_layout(
+        rect,
+        UNBOUNDED_VIEWPORT,
+        egui::vec2(GCARD_WIDTH, height),
+        egui::Vec2::ZERO,
+        0.0,
+    );
+    PopupLayout {
+        list: layout.list,
+        flyout: egui::Rect::from_min_size(layout.list.min, egui::Vec2::ZERO),
+    }
+}
+
+/// Renders the card and returns the chosen action plus the card's drawn height, which the caller
+/// keeps for hit-testing on later frames.
+#[allow(clippy::too_many_arguments)]
+pub fn render_gcard(
+    ui: &mut egui::Ui,
+    layout: PopupLayout,
+    lint: &Lint,
+    source_text: &str,
+    ai: Option<&AiCard>,
+    expanded: bool,
+    markdown_cache: &mut CommonMarkCache,
+) -> (Option<LintCardAction>, f32) {
+    let problem = problem_text(lint, source_text);
+    let span = (lint.span.start, lint.span.end);
+    let inner_width = GCARD_WIDTH - 2.0 * GCARD_PAD_X;
+    let response = egui::Area::new(egui::Id::new("harper-plus-card"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(layout.list.min)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(GCARD_WIDTH);
+            card_frame()
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(GCARD_PAD_X as i8, GCARD_PAD_Y as i8))
+                .show(ui, |ui| {
+                    ui.set_width(inner_width);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("harper-plus-card", span))
+                        .max_height(GCARD_MAX_HEIGHT - 2.0 * GCARD_PAD_Y)
+                        .show(ui, |ui| {
+                            ui.set_width(inner_width);
+                            gcard_contents(ui, lint, &problem, ai, expanded, markdown_cache)
+                        })
+                        .inner
+                })
+                .inner
+        });
+    (response.inner, response.response.rect.height())
+}
+
+fn gcard_contents(
+    ui: &mut egui::Ui,
+    lint: &Lint,
+    problem: &str,
+    ai: Option<&AiCard>,
+    expanded: bool,
+    markdown_cache: &mut CommonMarkCache,
+) -> Option<LintCardAction> {
+    let width = ui.available_width();
+    let mut action = None;
+
+    let heading = match ai {
+        Some(card) if lint.suggestions.is_empty() && card.active_tone.is_some() => {
+            card.heading.clone()
+        }
+        _ => lint.lint_kind.to_string(),
+    };
+    ui.label(egui::RichText::new(heading).size(13.0).color(MUTED_TEXT_COLOR));
+
+    let message_inline = lint.suggestions.is_empty();
+    if message_inline {
+        render_message_sized(ui, markdown_cache, &lint.message, lint.lint_kind, 14.0);
+    }
+
+    for suggestion in lint.suggestions.iter().take(3) {
+        let after = match suggestion {
+            Suggestion::ReplaceWith(chars) => chars.iter().collect(),
+            Suggestion::InsertAfter(chars) => format!("{problem}{}", chars.iter().collect::<String>()),
+            Suggestion::Remove => String::new(),
+        };
+        if diff_row(ui, problem, &after, width, GCARD_BIG, false).clicked() {
+            action = Some(LintCardAction::ApplySuggestion(suggestion.clone()));
+        }
+    }
+
+    if let Some(card) = ai.filter(|c| c.primary) {
+        match &card.status {
+            AiStatus::Pending => {
+                ui.label(
+                    egui::RichText::new("Writing a suggestion...")
+                        .size(13.0)
+                        .italics()
+                        .color(SUBTLE_TEXT_COLOR),
+                );
+            }
+            AiStatus::Error(message) => {
+                ui.label(egui::RichText::new(message).size(13.0).color(SUBTLE_TEXT_COLOR));
+            }
+            AiStatus::Ready(rewrites) => {
+                if let Some(best) = rewrites.first() {
+                    let clusters = rewrite_clusters(&card.target, best).map(|cs| {
+                        let (fs, fe) = card.focus;
+                        let touching: Vec<_> = cs
+                            .iter()
+                            .filter(|c| {
+                                card.target_start + c.start < fe && card.target_start + c.end > fs
+                            })
+                            .cloned()
+                            .collect();
+                        if touching.is_empty() { cs } else { touching }
+                    });
+                    match clusters {
+                        Some(cs) => {
+                            for c in cs {
+                                if diff_row(ui, &c.before, &c.after, width, GCARD_BIG, false)
+                                    .clicked()
+                                {
+                                    action = Some(LintCardAction::ApplyEdit {
+                                        start: card.target_start + c.start,
+                                        end: card.target_start + c.end,
+                                        text: c.after.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        None => {
+                            if diff_row(ui, &card.target, best, width, GCARD_BIG, true).clicked() {
+                                action = Some(LintCardAction::ApplyRewrite(best.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if expanded {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+        ui.painter()
+            .hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0_f32, DIVIDER_COLOR));
+        if !message_inline {
+            render_message_sized(ui, markdown_cache, &lint.message, lint.lint_kind, 14.0);
+        }
+        if let Some(card) = ai {
+            if let AiStatus::Ready(rewrites) = &card.status
+                && !rewrites.is_empty()
+            {
+                ui.label(
+                    egui::RichText::new("Rewrite the whole sentence")
+                        .size(12.5)
+                        .color(MUTED_TEXT_COLOR),
+                );
+                for rewrite in rewrites.iter() {
+                    if diff_row(ui, &card.target, rewrite, width, 15.0, true).clicked() {
+                        action = Some(LintCardAction::ApplyRewrite(rewrite.clone()));
+                    }
+                }
+            }
+            if card.tones_enabled {
+                ui.label(egui::RichText::new("Change the tone").size(12.5).color(MUTED_TEXT_COLOR));
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    for tone in Tone::ALL {
+                        let active = card.active_tone == Some(tone);
+                        let fill = if active { ACCENT_FILL } else { BUTTON_BACKGROUND };
+                        if flyout_button(
+                            ui,
+                            ButtonContent::Text(tone.label()),
+                            fill,
+                            format!("Rewrite to sound more {}", tone.name()),
+                        )
+                        .clicked()
+                        {
+                            action = Some(LintCardAction::SelectTone((!active).then_some(tone)));
+                        }
+                    }
+                });
+            }
+            if let Some(summary) = &card.tone_summary {
+                ui.label(
+                    egui::RichText::new(format!("Tone of this text: {summary}"))
+                        .size(12.5)
+                        .color(SUBTLE_TEXT_COLOR),
+                );
+            }
+        }
+        if icon_row(ui, CardIcon::None, "Disable this rule", width, 13.0).clicked() {
+            action = Some(LintCardAction::DisableRule);
+        }
+        if icon_row(ui, CardIcon::None, "Harper settings", width, 13.0).clicked() {
+            action = Some(LintCardAction::OpenSettings);
+        }
+    }
+
+    ui.add_space(2.0);
+    if icon_row(ui, CardIcon::Trash, "Dismiss", width, 15.0).clicked() {
+        action = Some(LintCardAction::IgnoreLint);
+    }
+    if is_spelling_kind(lint.lint_kind)
+        && icon_row(ui, CardIcon::Book, "Add to dictionary", width, 15.0).clicked()
+    {
+        action = Some(LintCardAction::AddToDictionary);
+    }
+    let more_label = if expanded { "See less" } else { "See more" };
+    if icon_row(ui, CardIcon::Dots, more_label, width, 15.0).clicked() {
+        action = Some(LintCardAction::ToggleMore);
+    }
+    action
+}
+
+#[derive(Clone, Copy)]
+enum CardIcon {
+    None,
+    Trash,
+    Book,
+    Dots,
+}
+
+fn icon_row(ui: &mut egui::Ui, icon: CardIcon, label: &str, width: f32, size: f32) -> egui::Response {
+    let height = size + 16.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect.expand2(egui::vec2(6.0, 0.0)), 6.0, HOVER_BACKGROUND);
+    }
+    let color = if hovered { TEXT_COLOR } else { MUTED_TEXT_COLOR };
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 9.0, rect.center().y),
+        egui::vec2(16.0, 16.0),
+    );
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    let p = ui.painter();
+    let label_left = match icon {
+        CardIcon::None => rect.left(),
+        CardIcon::Trash => {
+            let r = icon_rect;
+            p.hline(r.left()..=r.right(), r.top() + 3.5, stroke);
+            p.line_segment([r.left_top() + egui::vec2(5.5, 3.5), r.left_top() + egui::vec2(5.5, 1.0)], stroke);
+            p.line_segment([r.left_top() + egui::vec2(5.5, 1.0), r.left_top() + egui::vec2(10.5, 1.0)], stroke);
+            p.line_segment([r.left_top() + egui::vec2(10.5, 1.0), r.left_top() + egui::vec2(10.5, 3.5)], stroke);
+            p.add(egui::Shape::line(
+                vec![
+                    r.left_top() + egui::vec2(2.5, 3.5),
+                    r.left_top() + egui::vec2(3.5, 15.0),
+                    r.left_top() + egui::vec2(12.5, 15.0),
+                    r.left_top() + egui::vec2(13.5, 3.5),
+                ],
+                stroke,
+            ));
+            p.line_segment([r.left_top() + egui::vec2(6.5, 6.5), r.left_top() + egui::vec2(6.5, 12.0)], stroke);
+            p.line_segment([r.left_top() + egui::vec2(9.5, 6.5), r.left_top() + egui::vec2(9.5, 12.0)], stroke);
+            rect.left() + 28.0
+        }
+        CardIcon::Book => {
+            draw_glyph(ui, icon_rect, Glyph::BookDown, color);
+            rect.left() + 28.0
+        }
+        CardIcon::Dots => {
+            for dx in [-5.5_f32, 0.0, 5.5] {
+                p.circle_filled(icon_rect.center() + egui::vec2(dx, 0.0), 1.6, color);
+            }
+            rect.left() + 28.0
+        }
+    };
+    let galley = single_line_galley(ui, label, size, rect.right() - label_left);
+    paint_text(ui.painter(), label_left, rect.center().y, galley, color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A clickable before/after diff, drawn the Grammarly way.
+fn diff_row(
+    ui: &mut egui::Ui,
+    before: &str,
+    after: &str,
+    width: f32,
+    size: f32,
+    collapse_full_rewrites: bool,
+) -> egui::Response {
+    const PAD: f32 = 4.0;
+    let parts = word_diff(before, after);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    let normal = egui::TextFormat::simple(egui::FontId::proportional(size), TEXT_COLOR);
+    if collapse_full_rewrites && change_ratio(&parts, before) > 0.6 {
+        job.append(after, 0.0, normal);
+    } else if after.is_empty() {
+        job.append(
+            before,
+            0.0,
+            egui::TextFormat {
+                color: DEL_COLOR,
+                strikethrough: egui::Stroke::new(1.5_f32, DEL_COLOR),
+                ..normal
+            },
+        );
+    } else {
+        let mut last_was_del = false;
+        for part in parts {
+            match part {
+                DiffPart::Same(t) => {
+                    job.append(&t, 0.0, normal.clone());
+                    last_was_del = false;
+                }
+                DiffPart::Del(t) => {
+                    job.append(
+                        &t,
+                        0.0,
+                        egui::TextFormat {
+                            color: DEL_COLOR,
+                            strikethrough: egui::Stroke::new(1.5_f32, DEL_COLOR),
+                            ..normal.clone()
+                        },
+                    );
+                    last_was_del = true;
+                }
+                DiffPart::Ins(t) => {
+                    job.append(
+                        &t,
+                        if last_was_del { 5.0 } else { 0.0 },
+                        egui::TextFormat {
+                            font_id: fonts::bold(size),
+                            color: INS_COLOR,
+                            ..normal.clone()
+                        },
+                    );
+                    last_was_del = false;
+                }
+            }
+        }
+    }
+    let galley = ui.painter().layout_job(job);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, galley.size().y + 2.0 * PAD),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.expand2(egui::vec2(6.0, 0.0)), 6.0, HOVER_BACKGROUND);
+    }
+    ui.painter()
+        .galley(rect.min + egui::vec2(0.0, PAD), galley, TEXT_COLOR);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn render_message_sized(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    message: &str,
+    lint_kind: LintKind,
+    size: f32,
+) {
+    ui.scope(|ui| {
+        let [r, g, b, _] = lint_kind_color32(lint_kind).to_array();
+        let style = ui.style_mut();
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(size));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(size));
+        style.spacing.item_spacing = egui::vec2(0.0, 3.0);
+        style.visuals.override_text_color = Some(MUTED_TEXT_COLOR);
+        style.visuals.code_bg_color = egui::Color32::from_rgba_unmultiplied(r, g, b, 40);
+        CommonMarkViewer::new()
+            .default_width(Some(ui.available_width() as usize))
+            .show(ui, cache, message);
+    });
 }

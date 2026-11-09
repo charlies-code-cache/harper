@@ -146,6 +146,19 @@ where
         Ok(config)
     }
 
+    pub async fn get_ai_config(&mut self) -> Result<crate::ai::AiConfig, ProtocolError> {
+        match self.send_request(Request::GetAiConfig).await? {
+            Response::GetAiConfig { config } => Ok(config),
+            _ => Err(ProtocolError::UnexpectedResponse {
+                expected: "GetAiConfig",
+            }),
+        }
+    }
+
+    pub async fn set_ai_config(&mut self, config: crate::ai::AiConfig) -> Result<(), ProtocolError> {
+        self.send_ack_request(Request::SetAiConfig { config }).await
+    }
+
     pub async fn add_to_dictionary(&mut self, word: &str) -> Result<(), ProtocolError> {
         self.send_ack_request(Request::AddToDictionary {
             word: word.to_string(),

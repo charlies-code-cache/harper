@@ -115,13 +115,12 @@ impl OsBroker for WindowsBroker {
                     rects.into_iter().map(move |rect| {
                         let service = service.clone();
                         let suggestion_text = text.clone();
-                        let suggestion_span = lint.span;
                         ActionableLint::new(
                             rect,
                             lint_id.clone(),
                             lint.clone(),
                             text.clone(),
-                            move |suggestion| {
+                            move |suggestion_span, suggestion| {
                                 service.lock().unwrap().apply_suggestion(
                                     suggestion_text,
                                     suggestion_span,

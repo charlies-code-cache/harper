@@ -72,6 +72,17 @@ where
             Request::GetAutoEnableNewApps => Response::GetAutoEnableNewApps {
                 enabled: self.config.lock().await.auto_enable_new_apps,
             },
+            Request::GetAiConfig => Response::GetAiConfig {
+                config: self.config.lock().await.ai.clone(),
+            },
+            Request::SetAiConfig { config } => {
+                let mut stored = self.config.lock().await;
+                stored.ai = config.clone();
+                if let Err(error) = stored.save_to_system().await {
+                    eprintln!("failed to save AI config: {error}");
+                }
+                Response::Ack
+            }
             Request::ResolveIntegration { bundle_id } => {
                 let mut config = self.config.lock().await;
                 let previous_len = config.integrations.len();

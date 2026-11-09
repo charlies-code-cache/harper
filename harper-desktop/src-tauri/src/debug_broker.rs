@@ -30,7 +30,7 @@ impl OsBroker for DebugBroker {
                 priority: 1,
             },
             "This is some mocking text.".to_string(),
-            |_| {},
+            |_, _| {},
         )])
     }
 

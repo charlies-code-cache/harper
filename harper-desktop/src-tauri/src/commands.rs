@@ -49,7 +49,65 @@ pub fn application_message_handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool {
         stop_highlighter_service,
         launch_app,
         search_apps,
+        get_ai_config,
+        set_ai_config,
+        list_ollama_models,
+        test_ai,
+        frontend_log,
     ]
+}
+
+#[tauri::command]
+async fn get_ai_config(
+    config: State<'_, Arc<Mutex<Config>>>,
+) -> Result<crate::ai::AiConfig, String> {
+    Ok(config.lock().await.ai.clone())
+}
+
+#[tauri::command]
+async fn set_ai_config(
+    ai: crate::ai::AiConfig,
+    config: State<'_, Arc<Mutex<Config>>>,
+) -> Result<(), String> {
+    let mut config = config.lock().await;
+    config.ai = ai;
+    config
+        .save_to_system()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_ollama_models(url: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::ai::list_models(&url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Runs one sample rewrite and returns the first result and how long it took, in seconds.
+#[tauri::command]
+async fn test_ai(ai: crate::ai::AiConfig) -> Result<(String, f64), String> {
+    let (rewrites, seconds) =
+        tauri::async_runtime::spawn_blocking(move || crate::ai::test_rewrite(&ai))
+            .await
+            .map_err(|error| error.to_string())??;
+    Ok((rewrites.into_iter().next().unwrap_or_default(), seconds))
+}
+
+/// Writes frontend errors to `~/Library/Logs/harper-plus.log` so WebView failures can be diagnosed
+/// in release builds.
+#[tauri::command]
+fn frontend_log(level: String, message: String) {
+    use std::io::Write as _;
+    eprintln!("[webview {level}] {message}");
+    if let Some(dir) = dirs::home_dir().map(|h| h.join("Library/Logs"))
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("harper-plus.log"))
+    {
+        let _ = writeln!(file, "[webview {level}] {message}");
+    }
 }
 
 #[tauri::command]

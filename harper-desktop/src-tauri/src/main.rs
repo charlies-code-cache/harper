@@ -38,6 +38,7 @@ use tokio::{
     sync::Mutex,
 };
 
+pub mod ai;
 mod args;
 pub mod color;
 mod commands;
@@ -337,7 +338,10 @@ pub fn run_highlighter(has_parent: bool) {
         let mut debounce_state = lint_debounce_state.borrow_mut();
 
         match debounce_state.status(text, debounce_ms) {
-            DebounceStatus::Cached(lints) => return lints,
+            DebounceStatus::Cached(mut lints) => {
+                add_ai_lints(text, &mut lints, &lint_ignored_lints.borrow());
+                return lints;
+            }
             DebounceStatus::Ready => {}
         }
 
@@ -352,6 +356,7 @@ pub fn run_highlighter(has_parent: bool) {
 
         debounce_state.store_lints(text, debounce_ms, &organized_lints);
 
+        add_ai_lints(text, &mut organized_lints, &lint_ignored_lints.borrow());
         organized_lints
     };
 
@@ -388,9 +393,10 @@ pub fn run_highlighter(has_parent: bool) {
             auto_enable_new_apps: false,
             onboarding_completed: false,
             debounce_ms: *dictionary_debounce_ms.borrow(),
-            auto_update: true,
+            auto_update: false,
             last_update_check: None,
             highlighter_service_enabled: true,
+            ai: ai::engine().config(),
         };
         *dictionary_linter.borrow_mut() = config.create_linter();
 
@@ -404,7 +410,7 @@ pub fn run_highlighter(has_parent: bool) {
         }
     };
 
-    let disable_rule = move |rule_name: &str| match disable_runtime.block_on(
+    let disable_rule_inner = move |rule_name: &str| match disable_runtime.block_on(
         disable_client
             .lock()
             .expect("IPC client lock poisoned")
@@ -412,6 +418,29 @@ pub fn run_highlighter(has_parent: bool) {
     ) {
         Ok(config) => disable_linter.borrow_mut().config = config,
         Err(error) => eprintln!("failed to disable rule {rule_name}: {error}"),
+    };
+    let ai_client = client.clone();
+    let ai_runtime = sync_runtime.clone();
+    let disable_rule = move |rule_name: &str| {
+        if rule_name == ai::AI_RULE {
+            // "Disable this rule" on an AI lint turns off the AI scans instead of a Harper rule.
+            let mut config = ai::engine().config();
+            config.clarity = false;
+            config.word_choice = false;
+            ai::engine().set_config(config.clone());
+            if has_parent
+                && let Err(error) = ai_runtime.block_on(
+                    ai_client
+                        .lock()
+                        .expect("IPC client lock poisoned")
+                        .set_ai_config(config),
+                )
+            {
+                eprintln!("failed to save AI config: {error}");
+            }
+            return;
+        }
+        disable_rule_inner(rule_name)
     };
 
     let open_settings = move || {
@@ -522,6 +551,7 @@ fn fetch_highlighter_config(
         let integrations = client.get_integrations().await?;
         let auto_enable_new_apps = client.get_auto_enable_new_apps().await?;
         let debounce_ms = client.get_debounce_ms().await?;
+        let ai = client.get_ai_config().await?;
 
         Ok(Config {
             dialect,
@@ -532,9 +562,10 @@ fn fetch_highlighter_config(
             auto_enable_new_apps,
             onboarding_completed: false,
             debounce_ms,
-            auto_update: true,
+            auto_update: false,
             last_update_check: None,
             highlighter_service_enabled: true,
+            ai,
         })
     })
 }
@@ -567,4 +598,87 @@ fn apply_highlighter_config(
         Err(error) => eprintln!("failed to update integrations: {error}"),
     }
     *debounce_ms.borrow_mut() = config.debounce_ms;
+    ai::engine().set_config(config.ai);
+}
+
+/// Harper Plus: merges cached AI findings into the lint map, starts prefetching rewrites in
+/// background mode, and narrows long flags to the words a rewrite changes (Grammarly-style).
+/// Never blocks: model work is queued on the AI thread.
+fn add_ai_lints(text: &str, lints: &mut BTreeMap<String, Vec<Lint>>, ignored: &IgnoredLints) {
+    let engine = ai::engine();
+    let config = engine.config();
+    if !config.enabled {
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+
+    let ai_lints: Vec<Lint> = engine
+        .scan(&chars)
+        .into_iter()
+        .map(|finding| Lint {
+            span: harper_core::Span::new(finding.start, finding.end),
+            lint_kind: finding.kind.lint_kind(),
+            suggestions: Vec::new(),
+            message: if finding.reason.is_empty() {
+                format!("Possible {} issue.", finding.kind.label().to_lowercase())
+            } else {
+                finding.reason
+            },
+            priority: 200,
+        })
+        .collect();
+    if !ai_lints.is_empty() {
+        lints.insert(ai::AI_RULE.to_string(), ai_lints);
+    }
+
+    let mut changed = false;
+    for (rule, rule_lints) in lints.iter_mut() {
+        let mut out = Vec::with_capacity(rule_lints.len());
+        for lint in rule_lints.drain(..) {
+            let target = ai::lint_target(&config, &chars, rule, &lint);
+            if let Some(t) = &target
+                && config.timing == ai::AiTiming::Prefetch
+            {
+                engine.rewrites(&t.text, &t.context, &t.goal, ai::Priority::Prefetch);
+            }
+            let words = chars[lint.span.start.min(chars.len())..lint.span.end.min(chars.len())]
+                .split(|c| c.is_whitespace())
+                .filter(|w| !w.is_empty())
+                .count();
+            if words <= 4 || !lint.suggestions.is_empty() {
+                out.push(lint);
+                continue;
+            }
+            let mut ranges: Vec<(usize, usize)> = target
+                .as_ref()
+                .and_then(|t| {
+                    engine.peek_rewrites(&t.text, &t.goal).map(|r| {
+                        ai::changed_ranges(&t.text, &r[0])
+                            .into_iter()
+                            .map(|(s, e)| (t.start + s, t.start + e))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            if ranges.is_empty() {
+                ranges.push(ai::anchor_range(&chars, lint.span.start, lint.span.end));
+            }
+            changed = true;
+            for (start, end) in ranges.into_iter().take(6) {
+                out.push(Lint {
+                    span: harper_core::Span::new(start, end),
+                    ..lint.clone()
+                });
+            }
+        }
+        *rule_lints = out;
+    }
+
+    if changed || lints.contains_key(ai::AI_RULE) {
+        let dictionary = Config::dictionary_from_user_dictionary(MutableDictionary::new());
+        let doc = Document::new_markdown_default(text, &dictionary);
+        for rule_lints in lints.values_mut() {
+            ignored.remove_ignored(rule_lints, &doc);
+        }
+    }
 }

@@ -1,5 +1,8 @@
 use crate::color::Color;
-use harper_core::linting::{Lint, Suggestion};
+use harper_core::{
+    Span,
+    linting::{Lint, Suggestion},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -65,7 +68,7 @@ pub struct ActionableLint {
     pub rule_name: String,
     pub lint: Lint,
     pub source_text: String,
-    apply_suggestion: Option<Box<dyn FnOnce(Suggestion)>>,
+    apply_suggestion: Option<Box<dyn FnOnce(Span<char>, Suggestion)>>,
 }
 
 impl PositionedLint {
@@ -80,7 +83,7 @@ impl ActionableLint {
         rule_name: String,
         lint: Lint,
         source_text: String,
-        apply_suggestion: impl FnOnce(Suggestion) + 'static,
+        apply_suggestion: impl FnOnce(Span<char>, Suggestion) + 'static,
     ) -> Self {
         Self {
             rect,
@@ -92,8 +95,17 @@ impl ActionableLint {
     }
 
     pub fn apply_suggestion(&mut self, suggestion: Suggestion) {
+        let span = self.lint.span;
         if let Some(apply_suggestion) = self.apply_suggestion.take() {
-            apply_suggestion(suggestion);
+            apply_suggestion(span, suggestion);
+        }
+    }
+
+    /// Harper Plus: replaces an arbitrary span of the source text (e.g. a whole sentence) with an
+    /// AI rewrite, through the same OS-specific callback suggestions use.
+    pub fn apply_replacement(&mut self, span: Span<char>, text: &str) {
+        if let Some(apply_suggestion) = self.apply_suggestion.take() {
+            apply_suggestion(span, Suggestion::ReplaceWith(text.chars().collect()));
         }
     }
 }

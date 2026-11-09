@@ -1,7 +1,7 @@
 mod error;
 mod integration;
 
-use crate::{PlatformBroker, os_broker::OsBroker};
+use crate::{PlatformBroker, ai::AiConfig, os_broker::OsBroker};
 pub use error::Error;
 use harper_core::{
     Dialect, IgnoredLints,
@@ -29,6 +29,8 @@ pub struct Config {
     /// Failed attempts also count toward the automatic 24-hour interval.
     pub last_update_check: Option<u64>,
     pub highlighter_service_enabled: bool,
+    /// Harper Plus AI settings.
+    pub ai: AiConfig,
 }
 
 impl Config {
@@ -42,9 +44,11 @@ impl Config {
             auto_enable_new_apps: false,
             onboarding_completed: false,
             debounce_ms: 0,
-            auto_update: true,
+            // Harper Plus: never let the official updater replace this fork.
+            auto_update: false,
             last_update_check: None,
             highlighter_service_enabled: true,
+            ai: AiConfig::default(),
         }
     }
 
@@ -198,6 +202,7 @@ impl Config {
             "auto_update": self.auto_update,
             "last_update_check": self.last_update_check,
             "highlighter_service_enabled": self.highlighter_service_enabled,
+            "ai": &self.ai,
         }))
     }
 
@@ -220,7 +225,7 @@ impl Config {
             onboarding_completed: deserialize_optional_field(object, "onboarding_completed")?
                 .unwrap_or(true),
             debounce_ms: deserialize_optional_field(object, "debounce_ms")?.unwrap_or(0),
-            auto_update: deserialize_optional_field(object, "auto_update")?.unwrap_or(true),
+            auto_update: deserialize_optional_field(object, "auto_update")?.unwrap_or(false),
             last_update_check: deserialize_optional_field::<Option<u64>>(
                 object,
                 "last_update_check",
@@ -231,6 +236,7 @@ impl Config {
                 "highlighter_service_enabled",
             )?
             .unwrap_or(true),
+            ai: deserialize_optional_field(object, "ai")?.unwrap_or_default(),
         })
     }
 }
@@ -351,7 +357,7 @@ mod tests {
 
         let deserialized = Config::deserialize_main(&value.to_string()).unwrap();
 
-        assert!(deserialized.auto_update);
+        assert!(!deserialized.auto_update);
         assert_eq!(deserialized.last_update_check, None);
     }
 

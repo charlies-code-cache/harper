@@ -5,6 +5,26 @@
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Harper Desktop</title>
+    <script>
+      // Harper Plus: report WebView errors to ~/Library/Logs/harper-plus.log, since release builds
+      // have no console. A blank window is otherwise impossible to diagnose.
+      (function () {
+        function send(level, message) {
+          try {
+            var t = window.__TAURI_INTERNALS__;
+            if (t && t.invoke) t.invoke('frontend_log', { level: level, message: String(message) });
+          } catch (e) {}
+        }
+        window.addEventListener('error', function (e) {
+          send('error', (e.message || e) + ' @ ' + (e.filename || '') + ':' + (e.lineno || ''));
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason;
+          send('unhandledrejection', (r && (r.stack || r.message)) || r);
+        });
+        send('info', 'page loaded: ' + location.href + ' ua=' + navigator.userAgent);
+      })();
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">

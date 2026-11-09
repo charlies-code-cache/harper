@@ -4,6 +4,7 @@ import { Client } from '$lib/client';
 import SettingsSidebar from './SettingsSidebar.svelte';
 import './settings.css';
 import AboutPage from './pages/AboutPage.svelte';
+import AiPage from './pages/AiPage.svelte';
 import DictionaryPage from './pages/DictionaryPage.svelte';
 import GeneralPage from './pages/GeneralPage.svelte';
 import GettingStartedPage from './pages/GettingStartedPage.svelte';
@@ -21,6 +22,7 @@ let onboardingCompleted = false;
 
 const titleMap: Record<SectionId, string> = {
 	general: 'General',
+	ai: 'AI',
 	writing: 'Writing',
 	dictionary: 'Dictionary',
 	shortcuts: 'Shortcuts',
@@ -66,6 +68,8 @@ $: if (contentEl && active) {
     <main bind:this={contentEl} class="content" aria-label={title}>
       {#if active === "general"}
         <GeneralPage />
+      {:else if active === "ai"}
+        <AiPage />
       {:else if active === "writing"}
         <WritingPage />
       {:else if active === "dictionary"}

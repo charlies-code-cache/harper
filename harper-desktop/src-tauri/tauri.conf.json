@@ -34,7 +34,7 @@
 		"updater": {
 			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVFREI1NzQ2NjNFMTgyREQKUldUZGd1RmpSbGZiN3BieGRYZjUxZVhWZDRBcWVlTVlHa3BMa2tIdDZVVDFsWHUyZkplMDU1S2QK",
 			"endpoints": [
-				"https://writewithharper.com/download-harper-desktop/{{target}}/{{arch}}/{{current_version}}"
+				"https://github.com/charlies-code-cache/harper/releases/download/harper-plus-desktop/latest.json"
 			]
 		}
 	}

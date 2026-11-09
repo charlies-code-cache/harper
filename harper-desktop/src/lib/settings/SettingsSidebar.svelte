@@ -8,11 +8,13 @@ import {
 	KeyIcon,
 	PackageIcon,
 	QuillIcon,
+	StarIcon,
 } from 'components';
 import { FOOTER_NAV_ITEMS, MAIN_NAV_ITEMS, type SectionId } from './settings-data';
 
 const SECTION_ICONS: Record<SectionId, typeof GearIcon> = {
 	general: GearIcon,
+	ai: StarIcon,
 	writing: QuillIcon,
 	dictionary: BookIcon,
 	shortcuts: KeyIcon,

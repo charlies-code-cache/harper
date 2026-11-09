@@ -58,7 +58,43 @@ export interface UpdateResult {
 
 /** Provides an easy-to-use interface for interacting with the main Rust Tauri process.
  * Relevant because that is where the canonical state is stored. */
+/** Harper Plus AI settings, mirroring `AiConfig` in `src-tauri/src/ai/mod.rs`. */
+export type AiConfig = {
+	enabled: boolean;
+	ollama_url: string;
+	model: string;
+	timing: 'hover' | 'prefetch';
+	rewrites: boolean;
+	rewrite_scope: 'sentence' | 'all';
+	clarity: boolean;
+	tone_detection: boolean;
+	tone_rewrites: boolean;
+	word_choice: boolean;
+	rewrite_count: number;
+	temperature: number;
+	scan_idle_ms: number;
+	style_note: string;
+	ignored: string[];
+};
+
 export class Client {
+	static async getAiConfig(): Promise<AiConfig> {
+		return await invoke('get_ai_config');
+	}
+
+	static async setAiConfig(ai: AiConfig): Promise<void> {
+		await invoke('set_ai_config', { ai });
+	}
+
+	static async listOllamaModels(url: string): Promise<string[]> {
+		return await invoke('list_ollama_models', { url });
+	}
+
+	/** Returns the first sample rewrite and how many seconds it took. */
+	static async testAi(ai: AiConfig): Promise<[string, number]> {
+		return await invoke('test_ai', { ai });
+	}
+
 	static async getLintConfig(): Promise<LintConfig> {
 		return await invoke<LintConfig>('get_lint_config');
 	}

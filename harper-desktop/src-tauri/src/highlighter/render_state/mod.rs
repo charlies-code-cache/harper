@@ -8,16 +8,18 @@ use std::time::Instant;
 use egui_commonmark::CommonMarkCache;
 use harper_core::{Document, linting::LintKind};
 
+#[allow(unused_imports)]
 use self::{
     draw_highlight::draw_highlight,
     popup_layout::{PopupLayout, approach},
     render_lint_card::{
-        FIRST_ROW_OFFSET, LintCardAction, TipLayout, popup_layout_for_lint, render_lint_card,
+        AiCard, FIRST_ROW_OFFSET, GCARD_MAX_HEIGHT, LintCardAction, gcard_layout, render_gcard, TipLayout, popup_layout_for_lint, render_lint_card,
         row_count, sidebar_target,
     },
 };
 use super::{AddToDictionary, DisableRule, IgnoreLint, OpenSettings};
 use crate::{
+    ai::{self, AiStatus, Priority, RewriteGoal, Tone},
     lint_kind_color::lint_kind_color,
     rect::{ActionableLint, Rect},
 };
@@ -73,6 +75,46 @@ pub struct RenderState {
     disable_rule: DisableRule,
 
     open_settings: OpenSettings,
+
+    /// Harper Plus: the tone chip selected in the open popup, if any.
+    ai_tone: Option<Tone>,
+    /// Harper Plus: whether "See more" is open in the card.
+    expanded: bool,
+    /// Harper Plus: the card's height from its last frame, for hit-testing.
+    card_height: Option<f32>,
+}
+
+/// Harper Plus: the text an AI rewrite replaces, and how to describe it.
+struct AiTarget {
+    span: harper_core::Span<char>,
+    text: String,
+    context: String,
+    goal: RewriteGoal,
+}
+
+/// Decides whether a lint's popup gets AI rewrites, and what they rewrite.
+fn ai_target(lint: &ActionableLint, tone: Option<Tone>) -> Option<AiTarget> {
+    let config = ai::engine().config();
+    let chars: Vec<char> = lint.source_text.chars().collect();
+    let target = ai::lint_target(&config, &chars, &lint.rule_name, &lint.lint)?;
+    let goal = match tone {
+        Some(t) if config.tone_rewrites => RewriteGoal::Tone(t),
+        _ => target.goal,
+    };
+    Some(AiTarget {
+        span: harper_core::Span::new(target.start, target.end),
+        text: target.text,
+        context: target.context,
+        goal,
+    })
+}
+
+fn ai_heading(goal: &RewriteGoal) -> String {
+    match goal {
+        RewriteGoal::Fix { .. } => "Improve your text".into(),
+        RewriteGoal::Tone(t) => format!("Make it more {}", t.name()),
+        RewriteGoal::Finding { kind, .. } => format!("Improve {}", kind.label().to_lowercase()),
+    }
 }
 
 impl RenderState {
@@ -98,6 +140,9 @@ impl RenderState {
             add_to_dictionary,
             disable_rule,
             open_settings,
+            ai_tone: None,
+            expanded: false,
+            card_height: None,
         };
         state.set_lints(rects);
         state
@@ -164,6 +209,9 @@ impl RenderState {
             return;
         }
         if self.highlighted_lint != highlighted_lint {
+            self.ai_tone = None;
+            self.expanded = false;
+            self.card_height = None;
             self.current_tip = choose_tip();
             self.tip_layout = None;
         }
@@ -174,6 +222,9 @@ impl RenderState {
 
     /// Clears all popup-session state, including a selected tip, for every close path.
     pub fn close_popup(&mut self) {
+        self.ai_tone = None;
+        self.expanded = false;
+        self.card_height = None;
         self.highlighted_lint = None;
         self.shown_suggestion = None;
         self.current_tip = None;
@@ -205,11 +256,9 @@ impl RenderState {
         self.highlighted_lint
             .and_then(|index| self.lints().get(index))
             .map(|positioned_lint| {
-                popup_layout_for_lint(
+                gcard_layout(
                     &positioned_lint.rect,
-                    &positioned_lint.lint,
-                    self.current_sidebar_position,
-                    self.tip_layout.as_ref().map_or(0.0, TipLayout::height),
+                    self.card_height.unwrap_or(GCARD_MAX_HEIGHT),
                 )
             })
     }
@@ -259,24 +308,73 @@ impl RenderState {
             && popup_window(screen_rects, &positioned_lint.rect) == Some(window)
         {
             let rect = to_window_space(&positioned_lint.rect, window_rect);
-            let layout = popup_layout_for_lint(
-                &rect,
-                &positioned_lint.lint,
-                self.current_sidebar_position,
-                self.tip_layout.as_ref().map_or(0.0, TipLayout::height),
-            );
+            let layout = gcard_layout(&rect, self.card_height.unwrap_or(GCARD_MAX_HEIGHT));
             let lint = positioned_lint.lint.clone();
             let source_text = positioned_lint.source_text.clone();
+            let target = ai_target(positioned_lint, self.ai_tone);
+            let ai_card = target.as_ref().map(|t| {
+                let config = ai::engine().config();
+                AiCard {
+                    heading: ai_heading(&t.goal),
+                    target: t.text.clone(),
+                    status: ai::engine().rewrites(&t.text, &t.context, &t.goal, Priority::Hover),
+                    tones_enabled: config.tone_rewrites,
+                    active_tone: self.ai_tone,
+                    target_start: t.span.start,
+                    focus: (positioned_lint.lint.span.start, positioned_lint.lint.span.end),
+                    primary: positioned_lint.lint.suggestions.is_empty(),
+                    tone_summary: if config.tone_detection
+                        && source_text.split_whitespace().count() >= 12
+                    {
+                        match ai::engine().tone(&source_text, Priority::Tone) {
+                            AiStatus::Ready(report) => Some(report.short()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    },
+                }
+            });
 
-            match render_lint_card(
+            let (card_action, card_height) = render_gcard(
                 ui,
                 layout,
                 &lint,
                 &source_text,
-                self.shown_suggestion,
-                self.tip_layout.as_ref(),
+                ai_card.as_ref(),
+                self.expanded,
                 &mut self.markdown_cache,
-            ) {
+            );
+            self.card_height = Some(card_height + 4.0);
+            match card_action {
+                Some(LintCardAction::ApplyEdit { start, end, text }) => {
+                    if let Some(actionable_lint) = self
+                        .last_lints
+                        .as_mut()
+                        .and_then(|lints| lints.get_mut(index))
+                    {
+                        actionable_lint.apply_replacement(harper_core::Span::new(start, end), &text);
+                    }
+                    self.close_popup();
+                }
+                Some(LintCardAction::ToggleMore) => {
+                    self.expanded = !self.expanded;
+                    self.card_height = None;
+                }
+                Some(LintCardAction::ApplyRewrite(text)) => {
+                    if let Some(target) = &target
+                        && let Some(actionable_lint) = self
+                            .last_lints
+                            .as_mut()
+                            .and_then(|lints| lints.get_mut(index))
+                    {
+                        actionable_lint.apply_replacement(target.span, &text);
+                    }
+                    self.close_popup();
+                }
+                Some(LintCardAction::SelectTone(tone)) => {
+                    self.ai_tone = tone;
+                }
                 Some(LintCardAction::Close) => self.close_popup(),
                 Some(LintCardAction::OpenSettings) => {
                     (self.open_settings)();
