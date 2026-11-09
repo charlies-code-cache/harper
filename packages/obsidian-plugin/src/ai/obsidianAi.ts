@@ -12,7 +12,7 @@ import {
 import type State from '../State';
 import type AiEngine from './AiEngine';
 import type { HttpTransport, Status } from './AiEngine';
-import { toneSummary } from './aiUi';
+import { goalHeading, renderDiff, toneSummary } from './aiUi';
 import type { RewriteGoal, ToneReport } from './prompts';
 import { TONES, type Tone, toneLabel } from './settings';
 import { lineAround } from './text';
@@ -84,9 +84,7 @@ export class RewriteModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass('harper-plus-modal');
-		const heading =
-			this.goal.kind === 'tone' ? `Rewrite: more ${this.goal.tone}` : 'Rewrite with Harper Plus';
-		this.setTitle(heading);
+		this.setTitle(goalHeading(this.goal));
 
 		const tones = contentEl.createDiv({ cls: 'harper-plus-modal-tones' });
 		for (const tone of TONES) {
@@ -112,7 +110,8 @@ export class RewriteModal extends Modal {
 				list.createEl('p', { text: s.message, cls: 'mod-warning' });
 			} else {
 				for (const rewrite of s.value) {
-					const b = list.createEl('button', { text: rewrite, cls: 'harper-plus-modal-option' });
+					const b = list.createEl('button', { cls: 'harper-plus-ai-rewrite harper-plus-modal-option' });
+					b.append(renderDiff(this.sel.text, rewrite));
 					b.onclick = () => this.apply(rewrite);
 				}
 			}
@@ -142,6 +141,17 @@ export class RewriteModal extends Modal {
 	}
 }
 
+const MODAL_CSS = `
+.cm-tooltip:has(.hp-card) { background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important; }
+.cm-tooltip:has(.hp-card) > .cm-tooltip-lint { padding: 0 !important; margin: 0 !important; background: transparent !important; }
+.harper-plus-modal-tones { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.harper-plus-modal-original { margin-bottom: 12px; }
+.harper-plus-modal-list { display: flex; flex-direction: column; gap: 6px; }
+.harper-plus-modal .harper-plus-ai-rewrite { text-align: left; white-space: normal; height: auto; line-height: 1.5; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+.harper-plus-modal .harper-plus-diff-del { color: #d93838; text-decoration: line-through; background: #d9383814; }
+.harper-plus-modal .harper-plus-diff-ins { color: #4a6ee0; font-weight: 600; text-decoration: none; background: #4a6ee014; }
+`;
+
 /** Wires the Obsidian-only AI pieces: commands, the editor menu, and the tone status bar item. */
 export class ObsidianAi {
 	private plugin: Plugin;
@@ -166,6 +176,11 @@ export class ObsidianAi {
 
 	public setup() {
 		const p = this.plugin;
+		const style = document.createElement('style');
+		style.id = 'harper-plus-modal-styles';
+		style.textContent = MODAL_CSS;
+		document.head.appendChild(style);
+		p.register(() => style.remove());
 		p.addCommand({
 			id: 'harper-plus-rewrite-selection',
 			name: 'Rewrite selection or line with AI',

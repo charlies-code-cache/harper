@@ -6,7 +6,8 @@ import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { minimatch } from 'minimatch';
 import type { MarkdownFileInfo } from 'obsidian';
 import AiEngine, { type Finding, type HttpTransport } from './ai/AiEngine';
-import { applyToView, type RewriteTarget, renderRewriteSection } from './ai/aiUi';
+import { applyToView, goalHeading, type RewriteTarget, renderRewriteSection } from './ai/aiUi';
+import { changeRatio, wordDiff } from './ai/diff';
 import { findingLabel, type FindingType, type RewriteGoal } from './ai/prompts';
 import { type AiSettings, withAiDefaults } from './ai/settings';
 import { lineAround, sentenceAround } from './ai/text';
@@ -212,8 +213,18 @@ export default class State {
 					lints.map((lint) => {
 						const span = lint.span();
 
+						const problem = lint.get_problem_text();
 						const actions: Action[] = lint.suggestions().map((sug): Action => {
 							return {
+								preview: {
+									before: problem,
+									after:
+										sug.kind() === SuggestionKind.Remove
+											? ''
+											: sug.kind() === SuggestionKind.Replace
+												? sug.get_replacement_text()
+												: problem + sug.get_replacement_text(),
+								},
 								kind: 'suggestion' as const,
 								name:
 									sug.kind() == SuggestionKind.Replace
@@ -316,7 +327,11 @@ export default class State {
 					}),
 				);
 
-				return harperDiagnostics.concat(this.aiDiagnostics(view, text));
+				return this.splitForDisplay(
+					view,
+					text,
+					harperDiagnostics.concat(this.aiDiagnostics(view, text)),
+				);
 			},
 			{
 				delay: this.delay,
@@ -350,6 +365,7 @@ export default class State {
 		if (s.timing === 'prefetch') {
 			ai.requestRewrites(target, context, goal, 'prefetch');
 		}
+		this.pendingTargets.set(`${from}:${to}`, { from: sentence.from, text: target, goal });
 
 		return (view, current) =>
 			renderRewriteSection({
@@ -361,6 +377,65 @@ export default class State {
 				apply: (t, rewrite) => applyToView(view, t, rewrite),
 				onResize: () => view.requestMeasure(),
 			});
+	}
+
+	/** AI targets of the diagnostics built in the current lint pass, keyed by `from:to`. */
+	private pendingTargets = new Map<string, { from: number; text: string; goal: RewriteGoal }>();
+	private watchedKeys = new Set<string>();
+
+	/**
+	 * Grammarly underlines only the words a fix changes, not whole sentences. Long diagnostics are
+	 * split into one underline per changed span once a rewrite is known, and shown as a short anchor
+	 * on the first words until then. Every piece opens the same suggestion card.
+	 */
+	private splitForDisplay(view: EditorView, text: string, diagnostics: Diagnostic[]): Diagnostic[] {
+		const ai = this.ai;
+		const targets = this.pendingTargets;
+		this.pendingTargets = new Map();
+		const out: Diagnostic[] = [];
+		for (const d of diagnostics) {
+			const span = text.slice(d.from, d.to);
+			if (span.split(/\s+/).filter(Boolean).length <= 4) {
+				out.push(d);
+				continue;
+			}
+			const group = `${d.source}:${d.from}:${d.to}:${d.message}`;
+			let ranges: { from: number; to: number }[] = [];
+			const target = targets.get(`${d.from}:${d.to}`);
+			if (ai != null && target != null) {
+				const key = ai.rewriteKey(target.text, target.goal);
+				const status = ai.peek<string[]>(key);
+				if (status?.state === 'ready') {
+					ranges = changedRanges(target.text, status.value[0]).map((r) => ({
+						from: target.from + r.from,
+						to: target.from + r.to,
+					}));
+				} else if (status?.state === 'pending' && !this.watchedKeys.has(key)) {
+					this.watchedKeys.add(key);
+					const off = ai.subscribe(key, () => {
+						off();
+						this.watchedKeys.delete(key);
+						this.refreshView(view);
+					});
+				}
+			}
+			if (ranges.length === 0) ranges = [anchorRange(text, d.from, d.to)];
+			for (const r of ranges.slice(0, 6)) out.push({ ...d, from: r.from, to: r.to, group });
+		}
+		return out;
+	}
+
+	/** Re-lints a view, waiting while a suggestion card is open because re-linting closes it. */
+	private refreshView(view: EditorView) {
+		if (view.dom.querySelector('.cm-tooltip-lint') != null) {
+			setTimeout(() => this.refreshView(view), 1500);
+			return;
+		}
+		try {
+			view.dispatch({ effects: aiRefreshEffect.of(null) });
+		} catch {
+			// The view was destroyed.
+		}
 	}
 
 	/** Turns cached AI scan findings into diagnostics and queues scans for settled paragraphs. */
@@ -388,6 +463,7 @@ export default class State {
 		if (this.aiSettings.timing === 'prefetch') {
 			ai.requestRewrites(f.quote, f.paragraph, goal, 'prefetch');
 		}
+		this.pendingTargets.set(`${f.from}:${f.to}`, { from: f.from, text: f.quote, goal });
 		const feature: 'clarity' | 'wordChoice' =
 			f.type === 'clarity' || f.type === 'conciseness' ? 'clarity' : 'wordChoice';
 		return {
@@ -396,7 +472,7 @@ export default class State {
 			source: AI_SOURCE,
 			severity: 'info',
 			markClass: `${lintKindClass(FINDING_KIND[f.type])} harper-plus-ai-range ${this.useWebStyleLints ? 'harper-web-style' : 'harper-squiggly-style'}`,
-			title: `${findingLabel(f.type)} (AI)`,
+			title: goalHeading(goal),
 			message: f.reason.length > 0 ? f.reason : `Possible ${findingLabel(f.type).toLowerCase()} issue.`,
 			actions: [],
 			ignore: async () => {
@@ -411,12 +487,7 @@ export default class State {
 					settings: this.aiSettings,
 					goal,
 					showTones: this.aiSettings.toneRewrites,
-					resolve: () => {
-						const range = current();
-						if (range == null) return null;
-						const now = view.state.doc.sliceString(range.from, range.to);
-						return now === f.quote ? { ...range, text: f.quote, context: f.paragraph } : null;
-					},
+					resolve: () => resolveTarget(view, current, f.quote, f.paragraph, false),
 					apply: (t, rewrite) => applyToView(view, t, rewrite),
 					onResize: () => view.requestMeasure(),
 				}),
@@ -589,16 +660,60 @@ function resolveTarget(
 	current: () => { from: number; to: number } | null,
 	target: string,
 	context: string,
+	trySentence = true,
 ): RewriteTarget | null {
 	const range = current();
 	if (range == null) return null;
 	const doc = view.state.doc.toString();
 	const sentence = sentenceAround(doc, range.from, range.to);
-	if (doc.slice(sentence.from, sentence.to) === target) {
+	if (trySentence && doc.slice(sentence.from, sentence.to) === target) {
 		return { ...sentence, text: target, context };
 	}
 	const line = lineAround(doc, range.from);
 	const idx = doc.slice(line.from, line.to).indexOf(target);
 	if (idx < 0) return null;
 	return { from: line.from + idx, to: line.from + idx + target.length, text: target, context };
+}
+
+/** Ranges in `before` (offsets into it) that a rewrite removes or changes, for underlining. */
+function changedRanges(before: string, after: string): { from: number; to: number }[] {
+	const parts = wordDiff(before, after);
+	if (changeRatio(parts, before) > 0.6) return [];
+	const ranges: { from: number; to: number }[] = [];
+	let cursor = 0;
+	let prev: string | null = null;
+	for (const p of parts) {
+		if (p.kind === 'same') {
+			const idx = before.indexOf(p.text, cursor);
+			if (idx >= 0) cursor = idx + p.text.length;
+		} else if (p.kind === 'del') {
+			const idx = before.indexOf(p.text, cursor);
+			if (idx >= 0) {
+				ranges.push({ from: idx, to: idx + p.text.length });
+				cursor = idx + p.text.length;
+			}
+		} else if (prev !== 'del') {
+			// Pure insertion: underline the word right before it, like Grammarly's "class ,".
+			let end = cursor;
+			while (end > 0 && /\s/.test(before[end - 1])) end--;
+			let start = end;
+			while (start > 0 && !/\s/.test(before[start - 1])) start--;
+			if (end > start) ranges.push({ from: start, to: end });
+		}
+		prev = p.kind;
+	}
+	return ranges;
+}
+
+/** A short underline on the first few words of a long flag, used until its rewrite is known. */
+function anchorRange(text: string, from: number, to: number): { from: number; to: number } {
+	const re = /\S+/g;
+	re.lastIndex = from;
+	let end = from;
+	for (let i = 0; i < 3; i++) {
+		const m = re.exec(text);
+		if (m == null || m.index >= to) break;
+		end = Math.min(to, m.index + m[0].length);
+	}
+	return { from, to: Math.max(end, from + 1) };
 }

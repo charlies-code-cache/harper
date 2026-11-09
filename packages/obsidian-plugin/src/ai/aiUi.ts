@@ -1,7 +1,8 @@
 import type { EditorView } from '@codemirror/view';
 import type AiEngine from './AiEngine';
 import type { Status } from './AiEngine';
-import type { RewriteGoal } from './prompts';
+import { changeRatio, wordDiff } from './diff';
+import { findingLabel, type RewriteGoal } from './prompts';
 import { type AiSettings, TONES, type Tone, toneLabel } from './settings';
 import type { Range } from './text';
 
@@ -51,46 +52,93 @@ function guard(node: HTMLElement, onClick: () => void) {
 	});
 }
 
+/** Grammarly-style header for a rewrite goal. */
+export function goalHeading(goal: RewriteGoal): string {
+	switch (goal.kind) {
+		case 'fix':
+			return 'Improve your text';
+		case 'tone':
+			return `Make it more ${goal.tone}`;
+		case 'finding':
+			return `Improve ${findingLabel(goal.findingType).toLowerCase()}`;
+	}
+}
+
 /**
- * Builds the "AI rewrites" block shown under Harper's suggestions.
- * It requests rewrites immediately (hover timing) or picks up prefetched ones, then fills in when ready.
+ * Renders a rewrite as one sentence with removed words struck through in red and new words in blue,
+ * like Grammarly. Mostly rewritten text is shown plainly so it stays readable.
  */
-export function renderRewriteSection(opts: RewriteSectionOptions): HTMLElement | null {
+export function renderDiff(before: string, after: string): HTMLElement {
+	const out = el('span', 'harper-plus-diff');
+	const parts = wordDiff(before, after);
+	if (changeRatio(parts, before) > 0.6) {
+		out.append(el('span', 'harper-plus-diff-new', after));
+		return out;
+	}
+	for (const part of parts) {
+		if (part.kind === 'same') out.append(document.createTextNode(part.text));
+		else if (part.kind === 'del') out.append(el('del', 'harper-plus-diff-del', part.text));
+		else {
+			out.append(document.createTextNode(' '));
+			out.append(el('ins', 'harper-plus-diff-ins', part.text));
+		}
+	}
+	return out;
+}
+
+/**
+ * Builds the AI part of a suggestion card: the best rewrite, shown large, plus a "more" block with
+ * the other rewrites and tone options. It requests rewrites (hover timing) or picks up prefetched
+ * ones, then fills in when ready.
+ */
+export function renderRewriteSection(
+	opts: RewriteSectionOptions,
+): { primary: HTMLElement; more: HTMLElement } | null {
 	const initial = opts.resolve();
 	if (initial == null || initial.text.trim().length < 3) return null;
 
-	const root = el('div', 'harper-plus-ai');
-	const header = el('div', 'harper-plus-ai-header');
-	const title = el('span', 'harper-plus-ai-title', 'AI rewrites');
-	const badge = el('span', 'harper-plus-ai-badge', opts.settings.model);
-	header.append(title, badge);
-	const list = el('div', 'harper-plus-ai-list');
-	root.append(header, list);
+	const primary = el('div', 'harper-plus-ai');
+	const more = el('div', 'harper-plus-ai-alt');
+	const altLabel = el('div', 'harper-plus-ai-label');
+	const altList = el('div', 'harper-plus-ai-alt');
+	more.append(altLabel, altList);
 
 	let goal = opts.goal;
 	let unsubscribe: (() => void) | null = null;
 	let activeChip: HTMLElement | null = null;
 
+	const rewriteButton = (original: string, rewrite: string) => {
+		const button = el('button', 'harper-plus-ai-rewrite');
+		button.append(renderDiff(original, rewrite));
+		button.type = 'button';
+		button.title = 'Click to use this rewrite';
+		guard(button, () => {
+			const target = opts.resolve();
+			if (target == null || !opts.apply(target, rewrite)) {
+				primary.replaceChildren(
+					el('div', 'harper-plus-ai-loading', 'The text changed. Hover the underline again.'),
+				);
+			}
+		});
+		return button;
+	};
+
 	const render = (status: Status<string[]>) => {
-		list.replaceChildren();
+		primary.replaceChildren();
+		altList.replaceChildren();
+		altLabel.textContent = '';
 		if (status.state === 'pending') {
-			list.append(el('div', 'harper-plus-ai-loading', 'Generating rewrites...'));
+			primary.append(el('div', 'harper-plus-ai-loading', 'Writing a suggestion...'));
 		} else if (status.state === 'error') {
-			list.append(el('div', 'harper-plus-ai-error', status.message));
+			primary.append(el('div', 'harper-plus-ai-error', status.message));
 		} else {
-			for (const rewrite of status.value) {
-				const button = el('button', 'harper-plus-ai-rewrite', rewrite);
-				button.type = 'button';
-				button.title = 'Click to use this rewrite';
-				guard(button, () => {
-					const target = opts.resolve();
-					if (target == null || !opts.apply(target, rewrite)) {
-						list.replaceChildren(
-							el('div', 'harper-plus-ai-error', 'The text changed. Hover the underline again.'),
-						);
-					}
-				});
-				list.append(button);
+			const original = opts.resolve()?.text ?? initial.text;
+			const [best, ...rest] = status.value;
+			if (activeChip) primary.append(el('div', 'harper-plus-ai-label', goalHeading(goal)));
+			primary.append(rewriteButton(original, best));
+			if (rest.length > 0) {
+				altLabel.textContent = 'Other rewrites';
+				for (const r of rest) altList.append(rewriteButton(original, r));
 			}
 		}
 		opts.onResize?.();
@@ -104,7 +152,7 @@ export function renderRewriteSection(opts: RewriteSectionOptions): HTMLElement |
 		render(status);
 		if (status.state === 'pending') {
 			unsubscribe = opts.engine.subscribe(key, () => {
-				if (!root.isConnected) {
+				if (!primary.isConnected) {
 					unsubscribe?.();
 					return;
 				}
@@ -115,36 +163,31 @@ export function renderRewriteSection(opts: RewriteSectionOptions): HTMLElement |
 	};
 
 	if (opts.showTones) {
+		more.append(el('div', 'harper-plus-ai-label', 'Change the tone'));
 		const tones = el('div', 'harper-plus-ai-tones');
-		tones.append(el('span', 'harper-plus-ai-tones-label', 'Tone:'));
 		for (const tone of TONES.slice(0, 5)) {
 			const chip = el('button', 'harper-plus-ai-chip', toneLabel(tone));
 			chip.type = 'button';
 			chip.title = `Rewrite to sound more ${tone}`;
 			guard(chip, () => {
+				activeChip?.classList.remove('is-active');
 				if (activeChip === chip) {
-					chip.classList.remove('is-active');
 					activeChip = null;
 					goal = opts.goal;
-					title.textContent = 'AI rewrites';
 				} else {
-					activeChip?.classList.remove('is-active');
 					chip.classList.add('is-active');
 					activeChip = chip;
 					goal = { kind: 'tone', tone };
-					title.textContent = `More ${tone}`;
 				}
 				load();
 			});
 			tones.append(chip);
 		}
-		root.append(tones);
+		more.append(tones);
 	}
 
-	// Defer the request until the node is attached, so a quickly dismissed hover still caches the result
-	// but listeners only update live DOM.
 	queueMicrotask(load);
-	return root;
+	return { primary, more };
 }
 
 /** Applies a rewrite to a CodeMirror view after confirming the target text is unchanged. */

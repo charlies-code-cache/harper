@@ -23,6 +23,7 @@ import {
 	WidgetType,
 } from '@codemirror/view';
 import elt from 'crelt';
+import { wordDiff as previewDiff } from './ai/diff';
 import { LINT_KIND_COLORS } from './lintKindColor';
 
 type Severity = 'hint' | 'info' | 'warning' | 'error';
@@ -62,7 +63,9 @@ export interface Diagnostic {
 	renderExtra?: (
 		view: EditorView,
 		current: () => { from: number; to: number } | null,
-	) => Node | null;
+	) => { primary: Node; more: Node | null } | null;
+	/// Harper Plus: diagnostics that share a group are one suggestion shown under several underlines.
+	group?: string;
 }
 
 /// An action associated with a diagnostic.
@@ -73,6 +76,8 @@ export interface Action {
 	title: string;
 	/// Optional kind marker for keyboard command routing.
 	kind?: 'suggestion' | 'dictionary';
+	/// Harper Plus: before/after text, drawn as a Grammarly-style inline diff.
+	preview?: { before: string; after: string };
 	/// The function to call when the user activates this action. Is
 	/// given the diagnostic's _current_ position, which may have
 	/// changed since the creation of the diagnostic, due to editing.
@@ -294,11 +299,130 @@ function lintTooltip(view: EditorView, pos: number, side: -1 | 1) {
 }
 
 function diagnosticsTooltip(view: EditorView, diagnostics: readonly Diagnostic[]) {
+	const seen = new Set<string>();
+	const unique = diagnostics.filter((d) => {
+		const key = d.group ?? `${d.from}:${d.to}:${d.source}:${d.message}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 	return elt(
 		'ul',
 		{ class: 'cm-tooltip-lint' },
-		diagnostics.map((d) => renderDiagnostic(view, d, false)),
+		unique.slice(0, 2).map((d) => renderCard(view, d)),
 	);
+}
+
+const ICON_TRASH =
+	'<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
+const ICON_DOTS =
+	'<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>';
+const ICON_BOOK =
+	'<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5V5a2 2 0 0 1 2-2h14v15H6.5A2.5 2.5 0 0 0 4 20.5 2.5 2.5 0 0 0 6.5 23H20"/></svg>';
+
+function iconRow(icon: string, label: string, onClick: () => void, cls = '') {
+	const row = elt('div', { class: `hp-row ${cls}`, role: 'button', tabindex: '-1' });
+	const ic = elt('span', { class: 'hp-row-icon' });
+	ic.innerHTML = icon;
+	row.append(ic, elt('span', {}, label));
+	row.addEventListener('mousedown', (e) => {
+		e.preventDefault();
+		e.stopPropagation();
+	});
+	row.addEventListener('click', (e) => {
+		e.preventDefault();
+		e.stopPropagation();
+		onClick();
+	});
+	return row;
+}
+
+/// Harper Plus: inline before/after diff, struck-out removals and bold insertions.
+function diffNode(before: string, after: string): Node {
+	const out = elt('span', { class: 'harper-plus-diff' });
+	for (const part of previewDiff(before, after)) {
+		if (part.kind === 'same') out.append(document.createTextNode(part.text));
+		else if (part.kind === 'del') out.append(elt('del', { class: 'harper-plus-diff-del' }, part.text));
+		else {
+			if (out.lastChild?.nodeName === 'DEL') out.append(document.createTextNode(' '));
+			out.append(elt('ins', { class: 'harper-plus-diff-ins' }, part.text));
+		}
+	}
+	return out;
+}
+
+/// Harper Plus: a compact, Grammarly-style suggestion card. The best fix is shown large; the
+/// explanation, alternatives, tones, and rule controls wait behind "See more".
+function renderCard(view: EditorView, diagnostic: Diagnostic) {
+	const current = () => {
+		const found = findDiagnostic(view.state.field(lintState).diagnostics, diagnostic);
+		return found ? { from: found.from, to: found.to } : null;
+	};
+	const card = elt('li', { class: 'hp-card cm-diagnostic' });
+	card.append(elt('div', { class: 'hp-card-header' }, diagnostic.title ?? ''));
+
+	const body = elt('div', { class: 'hp-card-body' });
+	const suggestions = (diagnostic.actions ?? []).filter((a) => a.kind !== 'dictionary');
+	for (const action of suggestions.slice(0, 3)) {
+		const button = elt('button', {
+			type: 'button',
+			class: 'hp-suggestion',
+			title: action.title,
+		});
+		button.append(action.preview ? diffNode(action.preview.before, action.preview.after) : action.name);
+		let fired = false;
+		const click = (e: Event) => {
+			e.preventDefault();
+			if (fired) return;
+			fired = true;
+			const found = findDiagnostic(view.state.field(lintState).diagnostics, diagnostic);
+			if (found) action.apply(view, found.from, found.to);
+		};
+		button.addEventListener('mousedown', click);
+		body.append(button);
+	}
+	const extra = diagnostic.renderExtra?.(view, current) ?? null;
+	if (extra) body.append(extra.primary);
+
+	const message = elt(
+		'div',
+		{ class: 'hp-card-message' },
+		diagnostic.renderMessage ? diagnostic.renderMessage(view) : diagnostic.message,
+	);
+	const showMessageNow = suggestions.length === 0;
+	if (showMessageNow) card.append(message);
+	card.append(body);
+
+	const more = elt('div', { class: 'hp-card-more' });
+	more.style.display = 'none';
+	if (!showMessageNow) more.append(message);
+	if (extra?.more) more.append(extra.more);
+	if (diagnostic.disable) {
+		more.append(
+			iconRow('', 'Disable this rule', () => diagnostic.disable?.(), 'hp-row-small'),
+		);
+	}
+
+	const rows = elt('div', { class: 'hp-card-rows' });
+	if (diagnostic.ignore) rows.append(iconRow(ICON_TRASH, 'Dismiss', () => diagnostic.ignore?.()));
+	const dictionary = (diagnostic.actions ?? []).find((a) => a.kind === 'dictionary');
+	if (dictionary) {
+		rows.append(
+			iconRow(ICON_BOOK, 'Add to dictionary', () => {
+				const found = findDiagnostic(view.state.field(lintState).diagnostics, diagnostic);
+				if (found) dictionary.apply(view, found.from, found.to);
+			}),
+		);
+	}
+	const toggle = iconRow(ICON_DOTS, 'See more', () => {
+		const open = more.style.display === 'none';
+		more.style.display = open ? '' : 'none';
+		(toggle.lastChild as HTMLElement).textContent = open ? 'See less' : 'See more';
+		view.requestMeasure();
+	});
+	rows.append(toggle);
+	card.append(more, rows);
+	return card;
 }
 
 /// The type of a function that produces diagnostics.
@@ -478,12 +602,6 @@ function renderDiagnostic(view: EditorView, diagnostic: Diagnostic, inPanel: boo
 				);
 			}),
 		),
-		inPanel || !diagnostic.renderExtra
-			? null
-			: diagnostic.renderExtra(view, () => {
-					const found = findDiagnostic(view.state.field(lintState).diagnostics, diagnostic);
-					return found ? { from: found.from, to: found.to } : null;
-				}),
 		elt('div', { class: 'cm-diagnosticRow' }, [
 			diagnostic.ignore &&
 				elt(
@@ -545,26 +663,60 @@ function underline(color: string) {
 	);
 }
 
+/// Harper Plus: Grammarly-style categories. Red is correctness, blue clarity, green engagement,
+/// purple delivery.
+const UNDERLINE_COLORS: Record<string, string> = {
+	Agreement: '#e5484d',
+	BoundaryError: '#e5484d',
+	Capitalization: '#e5484d',
+	Eggcorn: '#e5484d',
+	Grammar: '#e5484d',
+	Malapropism: '#e5484d',
+	Punctuation: '#e5484d',
+	Spelling: '#e5484d',
+	Typo: '#e5484d',
+	Readability: '#4a7cf0',
+	Redundancy: '#4a7cf0',
+	Repetition: '#4a7cf0',
+	WordOrder: '#4a7cf0',
+	WordChoice: '#15a46b',
+	Enhancement: '#15a46b',
+	Style: '#15a46b',
+	Usage: '#8a5cf5',
+	Nonstandard: '#8a5cf5',
+	Regionalism: '#8a5cf5',
+	Formatting: '#8a5cf5',
+	Miscellaneous: '#8a5cf5',
+};
+
 const lintKindRangeThemeStraight = Object.fromEntries(
-	Object.entries(LINT_KIND_COLORS).map(([lintKind, color]) => [
-		`.cm-lintRange.harper-lintRange-${lintKind}.harper-web-style`,
-		{
-			borderBottom: `2px solid ${color}`,
-			backgroundColor: `${color}22`,
-		},
-	]),
+	Object.keys(LINT_KIND_COLORS).map((lintKind) => {
+		const color = UNDERLINE_COLORS[lintKind] ?? '#4a7cf0';
+		return [
+			`.cm-lintRange.harper-lintRange-${lintKind}.harper-web-style`,
+			{
+				backgroundImage: 'none',
+				boxShadow: `inset 0 -2px 0 ${color}b3`,
+				backgroundColor: `${color}14`,
+			},
+		];
+	}),
 );
 
 const lintKindRangeThemeSquiggly = Object.fromEntries(
-	Object.entries(LINT_KIND_COLORS).map(([lintKind, color]) => [
-		`.cm-lintRange.harper-lintRange-${lintKind}.harper-squiggly-style`,
-		{
-			backgroundImage: underline(color),
-			backgroundPosition: 'left bottom',
-			backgroundRepeat: 'repeat-x',
-			paddingBottom: '0.7px',
-		},
-	]),
+	Object.keys(LINT_KIND_COLORS).map((lintKind) => {
+		const color = UNDERLINE_COLORS[lintKind] ?? '#4a7cf0';
+		return [
+			`.cm-lintRange.harper-lintRange-${lintKind}.harper-squiggly-style`,
+			{
+				backgroundImage: 'none',
+				textDecoration: `underline ${color}b3`,
+				textDecorationThickness: '2px',
+				textUnderlineOffset: '4px',
+				textDecorationSkipInk: 'none',
+			},
+		];
+	}),
 );
 
 const lintKindDiagnosticTheme = Object.fromEntries(
@@ -730,52 +882,110 @@ const baseTheme = EditorView.baseTheme({
 		margin: 0,
 	},
 
-	'.harper-plus-ai': {
-		marginTop: '6px',
-		paddingTop: '6px',
-		borderTop: '1px solid var(--background-modifier-border, #8884)',
+	'.cm-tooltip:has(> .cm-tooltip-lint)': {
+		border: 'none !important',
+		background: 'transparent !important',
+		boxShadow: 'none !important',
+	},
+	'.hp-card': {
+		listStyle: 'none',
+		width: '360px',
+		maxWidth: '90vw',
+		padding: '14px 18px 8px !important',
+		margin: '0 0 6px 0 !important',
+		borderRadius: '10px',
+		background: 'var(--background-primary, #fff)',
+		color: 'var(--text-normal, #1f2328)',
+		border: '1px solid var(--background-modifier-border, #e5e7eb)',
+		boxShadow: '0 6px 24px rgba(0,0,0,0.14)',
+		whiteSpace: 'normal !important',
+		fontSize: 'var(--font-text-size, 16px)',
 		display: 'flex',
 		flexDirection: 'column',
-		gap: '4px',
-		maxWidth: '460px',
-		whiteSpace: 'normal',
+		gap: '6px',
 	},
-	'.harper-plus-ai-header': {
+	'.hp-card-header': {
+		fontSize: '0.82em',
+		color: 'var(--text-muted, #6b7280)',
+		letterSpacing: '0.01em',
+	},
+	'.hp-card-message': {
+		fontSize: '0.9em',
+		color: 'var(--text-muted, #6b7280)',
+		lineHeight: '1.45',
+	},
+	'.hp-card-message p': { margin: 0 },
+	'.hp-card-body': {
+		display: 'flex',
+		flexDirection: 'column',
+		gap: '2px',
+	},
+	'.hp-suggestion, .harper-plus-ai-rewrite': {
+		all: 'unset',
+		display: 'block',
+		cursor: 'pointer',
+		fontSize: '1.12em',
+		lineHeight: '1.5',
+		padding: '4px 6px',
+		margin: '0 -6px',
+		borderRadius: '6px',
+		whiteSpace: 'normal',
+		color: 'var(--text-normal, #1f2328)',
+	},
+	'.hp-suggestion:hover, .harper-plus-ai-rewrite:hover': {
+		background: 'var(--background-modifier-hover, #f3f4f6)',
+	},
+	'.harper-plus-ai-alt .harper-plus-ai-rewrite': { fontSize: '1em' },
+	'.hp-card-rows': {
+		display: 'flex',
+		flexDirection: 'column',
+		marginTop: '4px',
+	},
+	'.hp-row': {
 		display: 'flex',
 		alignItems: 'center',
-		justifyContent: 'space-between',
-		gap: '8px',
+		gap: '10px',
+		padding: '6px 6px',
+		margin: '0 -6px',
+		borderRadius: '6px',
+		cursor: 'pointer',
+		color: 'var(--text-muted, #6b7280)',
+		fontSize: '0.95em',
 	},
-	'.harper-plus-ai-title': {
-		fontWeight: 'bold',
-		fontSize: '0.9em',
-		boxShadow: 'inset 0 -2px #8a5cf5',
+	'.hp-row:hover': {
+		background: 'var(--background-modifier-hover, #f3f4f6)',
+		color: 'var(--text-normal, #1f2328)',
 	},
-	'.harper-plus-ai-badge': {
-		fontSize: '0.75em',
-		opacity: '0.6',
-	},
-	'.harper-plus-ai-list': {
+	'.hp-row-icon': { display: 'inline-flex', width: '18px', justifyContent: 'center' },
+	'.hp-row-small': { fontSize: '0.85em', padding: '4px 6px' },
+	'.hp-card-more': {
 		display: 'flex',
 		flexDirection: 'column',
-		gap: '4px',
+		gap: '6px',
+		paddingTop: '6px',
+		borderTop: '1px solid var(--background-modifier-border, #e5e7eb)',
 	},
-	'.harper-plus-ai-rewrite': {
-		textAlign: 'left',
-		whiteSpace: 'normal',
-		height: 'auto',
-		lineHeight: '1.4',
-		padding: '6px 8px',
-		cursor: 'pointer',
-		borderRadius: '6px',
-		border: '1px solid var(--background-modifier-border, #8884)',
-		background: 'var(--background-secondary, #f6f8fa)',
-		color: 'var(--text-normal, inherit)',
-		fontSize: '0.92em',
+	'.harper-plus-ai, .harper-plus-ai-alt': {
+		display: 'flex',
+		flexDirection: 'column',
+		gap: '2px',
 	},
-	'.harper-plus-ai-rewrite:hover': {
-		borderColor: '#8a5cf5',
-		background: 'var(--background-modifier-hover, #8a5cf522)',
+	'.harper-plus-ai-label': {
+		fontSize: '0.8em',
+		color: 'var(--text-muted, #6b7280)',
+		marginTop: '2px',
+	},
+	'.harper-plus-diff-del': {
+		color: '#d93838',
+		textDecoration: 'line-through',
+		textDecorationColor: '#d93838',
+		backgroundColor: '#d9383814',
+	},
+	'.harper-plus-diff-ins': {
+		color: '#4a6ee0',
+		fontWeight: '600',
+		textDecoration: 'none',
+		backgroundColor: '#4a6ee014',
 	},
 	'.harper-plus-ai-loading, .harper-plus-ai-error': {
 		fontSize: '0.85em',
