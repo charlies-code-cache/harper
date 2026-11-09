@@ -15,7 +15,7 @@ const SYSTEM = [
 	'You are a careful writing assistant inside a grammar checker.',
 	"Keep the author's meaning, voice, and facts. Never invent information.",
 	'Keep Markdown, links, names, numbers, and quoted material exactly as written.',
-	'Do not use em dashes.',
+	'Do not use em dashes. Keep straight quotes straight.',
 	'Reply with JSON only.',
 ].join(' ');
 
@@ -44,11 +44,11 @@ export function goalKey(goal: RewriteGoal): string {
 function goalInstruction(goal: RewriteGoal): string {
 	switch (goal.kind) {
 		case 'fix':
-			return `A grammar checker flagged this problem: "${goal.problem}". Rewrite the TEXT so the problem is gone. If the problem is length, split or tighten it.`;
+			return `A grammar checker flagged this problem: "${goal.problem}". Edit the TEXT so the problem is gone, changing as few words as possible. If the problem is length, split or tighten it.`;
 		case 'tone':
 			return `Rewrite the TEXT so it sounds more ${goal.tone}, without changing what it says.`;
 		case 'finding':
-			return `The TEXT has a ${findingLabel(goal.findingType).toLowerCase()} problem: ${goal.reason}. Rewrite it to fix that.`;
+			return `The TEXT has a ${findingLabel(goal.findingType).toLowerCase()} problem: ${goal.reason}. Edit it to fix that, changing as few words as possible.`;
 	}
 }
 

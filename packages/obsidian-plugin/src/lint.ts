@@ -887,6 +887,9 @@ const baseTheme = EditorView.baseTheme({
 		background: 'transparent !important',
 		boxShadow: 'none !important',
 	},
+	'.hp-active-sentence': { backgroundColor: 'rgba(74,124,240,0.13)' },
+	'.hp-active-word': { boxShadow: 'inset 0 -2px 0 #4a7cf0' },
+	'.hp-cluster-context': { color: 'var(--text-muted, #6b7280)' },
 	'.hp-card': {
 		listStyle: 'none',
 		width: '360px',
@@ -1105,7 +1108,81 @@ const commandTooltipField = StateField.define<readonly Tooltip[]>({
 	provide: (f) => showTooltip.computeN([f], (state) => state.field(f)),
 });
 
+/// Harper Plus: while a suggestion card is open, the sentence it rewrites gets a light highlight
+/// and its edited words a stronger underline, like Grammarly.
+export type ActiveHighlight = { sentence: { from: number; to: number }; words: { from: number; to: number }[] };
+export const setActiveHighlight = StateEffect.define<ActiveHighlight | null>();
+
+const activeHighlightField = StateField.define<DecorationSet>({
+	create() {
+		return Decoration.none;
+	},
+	update(value, tr) {
+		value = value.map(tr.changes);
+		for (const e of tr.effects) {
+			if (!e.is(setActiveHighlight)) continue;
+			if (e.value == null) {
+				value = Decoration.none;
+				continue;
+			}
+			const len = tr.state.doc.length;
+			const ranges = [
+				Decoration.mark({ class: 'hp-active-sentence' }).range(
+					Math.min(e.value.sentence.from, len),
+					Math.min(e.value.sentence.to, len),
+				),
+				...e.value.words
+					.filter((w) => w.to > w.from && w.to <= len)
+					.map((w) => Decoration.mark({ class: 'hp-active-word' }).range(w.from, w.to)),
+			].filter((r) => r.from < r.to);
+			value = Decoration.set(ranges, true);
+		}
+		return value;
+	},
+	provide: (f) => EditorView.decorations.from(f),
+});
+
+/// Shows the highlight now and clears it once `dom` leaves the page (the card closed).
+const shownHighlight = new WeakMap<EditorView, { key: string; dom: HTMLElement }>();
+
+/// Shows the highlight and clears it once `dom` leaves the page (the card closed).
+/// Dispatching recreates keyboard tooltips (and so the card), so identical requests are ignored;
+/// without that guard the card and the highlight would re-render each other forever.
+export function showActiveHighlight(view: EditorView, dom: HTMLElement, value: ActiveHighlight) {
+	const key = JSON.stringify(value);
+	const current = shownHighlight.get(view);
+	if (current?.key === key) {
+		current.dom = dom;
+		return;
+	}
+	const entry = { key, dom };
+	shownHighlight.set(view, entry);
+	requestAnimationFrame(() => {
+		if (shownHighlight.get(view) !== entry) return;
+		try {
+			view.dispatch({ effects: setActiveHighlight.of(value) });
+		} catch {
+			return;
+		}
+		const timer = setInterval(() => {
+			if (shownHighlight.get(view) !== entry) {
+				clearInterval(timer);
+				return;
+			}
+			if (entry.dom.isConnected) return;
+			clearInterval(timer);
+			shownHighlight.delete(view);
+			try {
+				view.dispatch({ effects: setActiveHighlight.of(null) });
+			} catch {
+				// The view was destroyed.
+			}
+		}, 300);
+	});
+}
+
 const lintExtensions = [
+	activeHighlightField,
 	tooltips({
 		position: 'absolute',
 		tooltipSpace: (view) => {

@@ -116,6 +116,15 @@ export function hash(s: string): string {
 	return (h >>> 0).toString(36);
 }
 
+/** Keeps the author's straight or curly quotes so rewrites do not show fake punctuation edits. */
+export function matchQuoteStyle(original: string, rewrite: string): string {
+	let out = rewrite;
+	if (!/[‘’]/.test(original)) out = out.replace(/[‘’]/g, "'");
+	if (!/[“”]/.test(original)) out = out.replace(/[“”]/g, '"');
+	if (!/—/.test(original)) out = out.replace(/\s*—\s*/g, ', ');
+	return out;
+}
+
 /** Cleans a model rewrite: trims quotes and drops results identical to the original. */
 export function cleanRewrites(original: string, rewrites: unknown, count: number): string[] {
 	if (!Array.isArray(rewrites)) return [];
@@ -127,6 +136,7 @@ export function cleanRewrites(original: string, rewrites: unknown, count: number
 		if (s.length >= 2 && /^["“]/.test(s) && /["”]$/.test(s) && !/^["“]/.test(original.trim())) {
 			s = s.slice(1, -1).trim();
 		}
+		s = matchQuoteStyle(original, s);
 		if (s.length === 0 || seen.has(s)) continue;
 		seen.add(s);
 		out.push(s);

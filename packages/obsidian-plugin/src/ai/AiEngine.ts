@@ -61,10 +61,44 @@ export default class AiEngine {
 	private running = false;
 	private firstSeen = new Map<string, number>();
 	private scanTimer: ReturnType<typeof setTimeout> | null = null;
+	private liveScanKeys = new Set<string>();
 
 	constructor(http: HttpTransport, getSettings: () => AiSettings) {
 		this.http = http;
 		this.getSettings = getSettings;
+		this.restore();
+	}
+
+	private static STORAGE_KEY = 'harper-plus-ai-cache-v1';
+	private saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Loads finished results saved by an earlier session, so flags come back instantly. */
+	private restore() {
+		try {
+			const raw = globalThis.localStorage?.getItem(AiEngine.STORAGE_KEY);
+			if (!raw) return;
+			for (const [key, value] of JSON.parse(raw) as [string, unknown][]) {
+				this.cache.set(key, { state: 'ready', value });
+			}
+		} catch {
+			// Storage is optional.
+		}
+	}
+
+	private schedulePersist() {
+		if (this.saveTimer) return;
+		this.saveTimer = setTimeout(() => {
+			this.saveTimer = null;
+			try {
+				const ready = [...this.cache.entries()]
+					.filter(([, s]) => s.state === 'ready')
+					.slice(-CACHE_LIMIT)
+					.map(([k, s]) => [k, (s as { value: unknown }).value]);
+				globalThis.localStorage?.setItem(AiEngine.STORAGE_KEY, JSON.stringify(ready));
+			} catch {
+				// Storage is optional.
+			}
+		}, 2000);
 	}
 
 	private get settings(): AiSettings {
@@ -107,6 +141,7 @@ export default class AiEngine {
 			this.cache.delete(oldest);
 		}
 		this.emit(key);
+		if (status.state === 'ready') this.schedulePersist();
 	}
 
 	public peek<T>(key: string): Status<T> | undefined {
@@ -150,8 +185,8 @@ export default class AiEngine {
 			while (this.queue.length > 0) {
 				const now = Date.now();
 				this.queue = this.queue.filter((j) => {
-					const keep =
-						PRIORITY_RANK[j.priority] >= PRIORITY_RANK.tone || now - j.requestedAt < STALE_MS;
+					// Only speculative prefetches expire; scans and hovers always finish.
+					const keep = j.priority !== 'prefetch' || now - j.requestedAt < STALE_MS;
 					if (!keep) this.cache.delete(j.key);
 					return keep;
 				});
@@ -268,6 +303,7 @@ export default class AiEngine {
 
 		for (const p of paragraphs) {
 			const key = `scan:${s.model}:${types.join(',')}:${hash(s.styleNote)}:${hash(p.text)}`;
+			this.liveScanKeys.add(key);
 			live.add(key);
 			const cached = this.peek<Omit<Finding, 'from' | 'to'>[]>(key);
 			if (cached?.state === 'ready') {

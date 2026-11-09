@@ -141,7 +141,37 @@ export class RewriteModal extends Modal {
 	}
 }
 
-const MODAL_CSS = `
+/** Grammarly-style underline colors: soft pink for correctness, light blue for clarity, green for
+ * engagement, lavender for delivery. */
+const UNDERLINE_GROUPS: [string[], string][] = [
+	[['Agreement', 'BoundaryError', 'Capitalization', 'Eggcorn', 'Grammar', 'Malapropism', 'Punctuation', 'Spelling', 'Typo'], '#ef8a98'],
+	[['Readability', 'Redundancy', 'Repetition', 'WordOrder'], '#8fb0f7'],
+	[['WordChoice', 'Enhancement', 'Style'], '#6fcf9e'],
+	[['Usage', 'Nonstandard', 'Regionalism', 'Formatting', 'Miscellaneous'], '#b79cf3'],
+];
+
+const UNDERLINE_CSS = [
+	`.cm-lintRange.harper-squiggly-style, .cm-lintRange.harper-web-style {
+		background-image: none !important;
+		background-color: transparent !important;
+		text-decoration-line: underline !important;
+		text-decoration-style: solid !important;
+		text-decoration-thickness: 3px !important;
+		text-underline-offset: 5px !important;
+		text-decoration-skip-ink: none !important;
+		text-decoration-color: #8fb0f7 !important;
+	}`,
+	...UNDERLINE_GROUPS.map(
+		([kinds, color]) =>
+			`${kinds.map((k) => `.cm-lintRange.harper-lintRange-${k}`).join(', ')} { text-decoration-color: ${color} !important; }`,
+	),
+	`.cm-lintRange.harper-web-style { background-color: rgba(143,176,247,0.10) !important; }`,
+	`.hp-active-word { text-decoration-color: #4a6ee0 !important; box-shadow: none !important; }`,
+	`.hp-active-word:not(.cm-lintRange) { text-decoration: underline 3px #4a6ee0; text-underline-offset: 5px; }`,
+].join('\n');
+
+const MODAL_CSS = `${UNDERLINE_CSS}
+
 .cm-tooltip:has(.hp-card) { background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important; }
 .cm-tooltip:has(.hp-card) > .cm-tooltip-lint { padding: 0 !important; margin: 0 !important; background: transparent !important; }
 .harper-plus-modal-tones { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
